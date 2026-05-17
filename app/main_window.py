@@ -17,6 +17,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 
 from app.worker import TranslationWorker
+from app import settings as _settings
 
 SUPPORTED_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".webp",
@@ -60,9 +61,6 @@ TRANSLATION_SERVICES = [
     "NLLB (Offline)",
 ]
 
-# Directory where the model manager stores downloaded GGUF files
-MODEL_DIR = Path.home() / ".cache" / "comic-translator" / "models"
-
 # Curated model list shown in the Model Manager dialog.
 # Each entry has one or more "options" (quantization variants the user can pick).
 GGUF_CATALOG = [
@@ -105,7 +103,7 @@ GGUF_CATALOG = [
     {
         "id":   "vntl-llama3-8b",
         "name": "VNTL LLaMA3 8B  (JP → EN specialist)",
-        "desc": "Fine-tuned on visual novel and manga dialogue. From the koharu project.",
+        "desc": "Fine-tuned on visual novel and manga dialogue.",
         "repo": "lmg-anon/vntl-llama3-8b-v2-gguf",
         "options": [
             {"label": "Q5_K_M — 5.7 GB  (recommended)",
@@ -708,10 +706,11 @@ class ModelRowWidget(QWidget):
     """
     use_requested = Signal(str)   # absolute local path, emitted on "Use This Model"
 
-    def __init__(self, info: dict, parent=None):
+    def __init__(self, info: dict, models_dir: Path, parent=None):
         super().__init__(parent)
-        self._info   = info
-        self._worker = None
+        self._info       = info
+        self._models_dir = models_dir
+        self._worker     = None
         self._build_ui()
 
     # ── helpers ── #
@@ -720,7 +719,7 @@ class ModelRowWidget(QWidget):
         return self._info["options"][self._combo.currentIndex()]
 
     def _local_path(self) -> Path:
-        return MODEL_DIR / self._opt()["filename"]
+        return self._models_dir / self._opt()["filename"]
 
     # ── UI ── #
 
@@ -759,6 +758,7 @@ class ModelRowWidget(QWidget):
 
         self._btn = QPushButton()
         self._btn.setFixedHeight(28)
+        self._btn_connected = False
         right_col.addWidget(self._btn)
         right_col.addStretch()
 
@@ -780,11 +780,10 @@ class ModelRowWidget(QWidget):
 
     def _set_btn(self, text, slot):
         self._btn.setText(text)
-        try:
+        if self._btn_connected:
             self._btn.clicked.disconnect()
-        except RuntimeError:
-            pass
         self._btn.clicked.connect(slot)
+        self._btn_connected = True
 
     # ── actions ── #
 
@@ -793,9 +792,9 @@ class ModelRowWidget(QWidget):
 
     def _start_download(self):
         from app.worker import ModelDownloadWorker
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        self._models_dir.mkdir(parents=True, exist_ok=True)
         self._worker = ModelDownloadWorker(
-            self._info["repo"], self._opt()["filename"], str(MODEL_DIR)
+            self._info["repo"], self._opt()["filename"], str(self._models_dir)
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_done)
@@ -819,14 +818,12 @@ class ModelRowWidget(QWidget):
         self._refresh_state()
 
     def _on_progress(self, downloaded: int, total: int):
-        mb  = downloaded / (1024 * 1024)
         if total > 0:
             self._progress.setValue(int(downloaded * 100 / total))
-            tmb = total / (1024 * 1024)
-            self._status_lbl.setText(f"Downloading…  {mb:.0f} / {tmb:.0f} MB")
+            self._status_lbl.setText(f"Downloading…  {downloaded} / {total} MB")
         else:
-            self._progress.setRange(0, 0)   # indeterminate
-            self._status_lbl.setText(f"Downloading…  {mb:.0f} MB")
+            self._progress.setRange(0, 0)
+            self._status_lbl.setText(f"Downloading…  {downloaded} MB")
 
     def _on_done(self, _):
         self._worker = None
@@ -860,12 +857,13 @@ class ModelManagerDialog(QDialog):
     Also lists auto-download models (NLLB, OPUS-MT, etc.) for reference.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, models_dir: Path | None = None):
         super().__init__(parent)
         self.setWindowTitle("Model Manager")
         self.setMinimumSize(760, 540)
         self.resize(900, 660)
         self.chosen_path: str | None = None
+        self._models_dir = models_dir or (_settings.APPDATA_DIR / "models")
         self._build_ui()
 
     def _build_ui(self):
@@ -896,7 +894,7 @@ class ModelManagerDialog(QDialog):
         vbox.setContentsMargins(2, 2, 2, 2)
 
         for info in GGUF_CATALOG:
-            row = ModelRowWidget(info)
+            row = ModelRowWidget(info, self._models_dir)
             row.use_requested.connect(self._on_use)
             frame = QFrame()
             frame.setFrameShape(QFrame.StyledPanel)
@@ -952,8 +950,10 @@ class MainWindow(QMainWindow):
         self.edit_data      = {}   # path → {'base': PIL, 'regions': list, 'target_lang': str}
         self.manual_zones   = {}   # path → list of bboxes drawn by user (forced OCR regions)
         self.worker         = None
+        self._cfg           = _settings.load()
 
         self._build_ui()
+        self._apply_settings()
         self.statusBar().showMessage("Ready — add files or a folder to begin.")
 
     # ------------------------------------------------------------------ #
@@ -1099,6 +1099,16 @@ class MainWindow(QMainWindow):
         self.gguf_hint.setOpenExternalLinks(True)
         self.gguf_hint.setStyleSheet("color: #aaa; font-size: 11px;")
 
+        self.models_dir_label = QLabel("Models folder:")
+        self.models_dir_edit  = QLineEdit()
+        self.models_dir_edit.setPlaceholderText("Folder where models are saved…")
+        self.models_dir_browse = QPushButton("…")
+        self.models_dir_browse.setFixedWidth(28)
+        self.models_dir_browse.clicked.connect(self._browse_models_dir)
+        models_dir_row = QHBoxLayout()
+        models_dir_row.addWidget(self.models_dir_edit)
+        models_dir_row.addWidget(self.models_dir_browse)
+
         self.gguf_manage_btn = QPushButton("Manage Models…")
         self.gguf_manage_btn.setStyleSheet(
             "background-color: #5a5a8a; color: white; font-weight: bold;"
@@ -1127,8 +1137,11 @@ class MainWindow(QMainWindow):
         gguf_gpu_row.addWidget(self.gguf_gpu_spin)
         gguf_gpu_row.addStretch()
 
-        for w in (self.gguf_label, self.gguf_hint, self.gguf_manage_btn):
+        for w in (self.gguf_label, self.gguf_hint,
+                  self.models_dir_label, self.gguf_manage_btn):
             w.hide(); g.addWidget(w)
+        self.models_dir_edit.hide(); self.models_dir_browse.hide()
+        g.addLayout(models_dir_row)
         self.gguf_input.hide(); self.gguf_browse.hide()
         g.addLayout(gguf_row)
         self.gguf_gpu_label.hide(); g.addWidget(self.gguf_gpu_label)
@@ -1260,26 +1273,66 @@ class MainWindow(QMainWindow):
     # Settings panel helpers                                              #
     # ------------------------------------------------------------------ #
 
+    def _apply_settings(self):
+        cfg = self._cfg
+        for combo, key in ((self.src_combo, "source_lang"),
+                           (self.tgt_combo, "target_lang"),
+                           (self.svc_combo, "service")):
+            idx = combo.findText(cfg[key])
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        self.deepl_input.setText(cfg["deepl_key"])
+        self.gguf_input.setText(cfg["gguf_path"])
+        self.gguf_gpu_spin.setValue(cfg["gguf_gpu_layers"])
+        self.models_dir_edit.setText(cfg["models_dir"])
+        self.output_edit.setText(cfg["output_dir"])
+
+    def _collect_settings(self) -> dict:
+        return {
+            "source_lang":     self.src_combo.currentText(),
+            "target_lang":     self.tgt_combo.currentText(),
+            "service":         self.svc_combo.currentText(),
+            "deepl_key":       self.deepl_input.text(),
+            "gguf_path":       self.gguf_input.text(),
+            "gguf_gpu_layers": self.gguf_gpu_spin.value(),
+            "models_dir":      self.models_dir_edit.text(),
+            "output_dir":      self.output_edit.text(),
+        }
+
+    def closeEvent(self, event):
+        _settings.save(self._collect_settings())
+        super().closeEvent(event)
+
     def _on_service_changed(self, text):
         show_deepl = (text == "DeepL (API Key)")
         show_gguf  = (text == "Local LLM (GGUF)")
         self.deepl_label.setVisible(show_deepl)
         self.deepl_input.setVisible(show_deepl)
-        for w in (self.gguf_label, self.gguf_hint, self.gguf_manage_btn,
+        for w in (self.gguf_label, self.gguf_hint,
+                  self.models_dir_label, self.models_dir_edit, self.models_dir_browse,
+                  self.gguf_manage_btn,
                   self.gguf_input, self.gguf_browse,
                   self.gguf_gpu_label, self.gguf_gpu_spin):
             w.setVisible(show_gguf)
 
+    def _browse_models_dir(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select models folder", self.models_dir_edit.text()
+        )
+        if folder:
+            self.models_dir_edit.setText(folder)
+
     def _browse_gguf(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select GGUF model file", "",
+            self, "Select GGUF model file", self.models_dir_edit.text(),
             "GGUF model (*.gguf);;All files (*)"
         )
         if path:
             self.gguf_input.setText(path)
 
     def _open_model_manager(self):
-        dlg = ModelManagerDialog(self)
+        models_dir = Path(self.models_dir_edit.text())
+        dlg = ModelManagerDialog(self, models_dir)
         if dlg.exec() == QDialog.Accepted and dlg.chosen_path:
             self.gguf_input.setText(dlg.chosen_path)
             self.statusBar().showMessage(

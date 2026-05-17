@@ -12,7 +12,7 @@ echo (This will take a few minutes and produce a large file ~400-600 MB)
 echo.
 
 pyinstaller ^
-  --onefile ^
+  --onedir ^
   --windowed ^
   --name "ComicTranslator" ^
   --icon NONE ^
@@ -26,9 +26,13 @@ pyinstaller ^
 
 echo.
 echo ============================================================
-echo  Done!  Your .exe is in the  dist\  folder.
+echo  Done!  Your app folder is at:  dist\ComicTranslator\
+echo  Share the entire ComicTranslator folder — not just the .exe.
 echo.
-echo  IMPORTANT: The first time the .exe runs it will download
+echo  Settings and downloaded models are saved to:
+echo  %%APPDATA%%\ComicTranslator\
+echo.
+echo  IMPORTANT: The first time the app runs it will download
 echo  EasyOCR model files (~200 MB) to  %%USERPROFILE%%\.EasyOCR\
 echo  This only happens once.
 echo ============================================================

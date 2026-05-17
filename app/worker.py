@@ -611,7 +611,7 @@ class ModelDownloadWorker(QThread):
                             return
                         f.write(chunk)
                         downloaded += len(chunk)
-                        self.progress.emit(downloaded, total)
+                        self.progress.emit(downloaded // (1024 * 1024), total // (1024 * 1024))
             tmp.rename(dest)
             self.finished.emit(str(dest))
         except Exception as exc:
