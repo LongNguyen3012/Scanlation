@@ -5,11 +5,10 @@ APPDATA_DIR = Path.home() / "AppData" / "Roaming" / "ComicTranslator"
 _FILE       = APPDATA_DIR / "settings.json"
 
 DEFAULTS: dict = {
-    "models_dir":      str(APPDATA_DIR / "models"),
     "source_lang":     "Japanese",
     "target_lang":     "English",
     "service":         "Google Translate",
-    "deepl_key":       "",
+    "models_dir":      str(APPDATA_DIR / "models"),
     "gguf_path":       "",
     "gguf_gpu_layers": 0,
     "output_dir":      "",

@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QLineEdit, QMenu, QDialog, QTableWidget, QTableWidgetItem,
     QSpinBox, QHeaderView, QSizePolicy, QFrame,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QPixmap, QImage, QPainter, QColor, QPen
 
 from app.worker import TranslationWorker
@@ -52,86 +52,47 @@ TARGET_LANGUAGES = {
 
 TRANSLATION_SERVICES = [
     "Google Translate",
-    "Baidu (Free)",
-    "Bing (Free)",
-    "MyMemory",
-    "DeepL (API Key)",
     "OPUS-MT (Offline)",
     "Local LLM (GGUF)",
-    "NLLB (Offline)",
 ]
 
-# Curated model list shown in the Model Manager dialog.
-# Each entry has one or more "options" (quantization variants the user can pick).
+# Each entry: repo = HuggingFace repo path, file = filename inside the repo
 GGUF_CATALOG = [
     {
-        "id":   "sakura-1.5b",
-        "name": "Sakura 1.5B  (JP → ZH specialist)",
-        "desc": "Tiny, CPU-friendly. Best for manga JP→ZH. Trained on light novel / manga dialogue.",
-        "repo": "SakuraLLM/Sakura-1.5B-Qwen2.5-v1.0-GGUF",
-        "options": [
-            {"label": "Q8_0 — 1.7 GB  (only quant available, recommended)",
-             "filename": "sakura-1.5b-qwen2.5-v1.0-q8_0.gguf", "size_gb": 1.7},
-        ],
+        "name": "Sakura 14B v1.0  (Q4_K_M)",
+        "desc": "Best for Japanese → Chinese/English manga. Purpose-built for manga/visual novels.",
+        "repo": "SakuraLLM/Sakura-14B-Qwen2.5-v1.0-GGUF",
+        "file": "sakura-14b-qwen2.5-v1.0-q4_k_m.gguf",
+        "size": "8.9 GB",
     },
     {
-        "id":   "qwen3-8b",
-        "name": "Qwen3-8B  (multilingual)",
-        "desc": "All language pairs. Modern reasoning model — strips <think> blocks automatically.",
-        "repo": "bartowski/Qwen_Qwen3-8B-GGUF",
-        "options": [
-            {"label": "Q4_K_M — 5.2 GB  (recommended, best speed/quality)",
-             "filename": "Qwen_Qwen3-8B-Q4_K_M.gguf", "size_gb": 5.2},
-            {"label": "Q6_K — 6.6 GB  (higher quality)",
-             "filename": "Qwen_Qwen3-8B-Q6_K.gguf", "size_gb": 6.6},
-            {"label": "Q8_0 — 8.6 GB  (highest quality)",
-             "filename": "Qwen_Qwen3-8B-Q8_0.gguf", "size_gb": 8.6},
-        ],
+        "name": "Qwen3 8B  (Q4_K_M)  — recommended",
+        "desc": "Best general multilingual model. Excellent for all CJK language pairs.",
+        "repo": "bartowski/Qwen3-8B-GGUF",
+        "file": "Qwen3-8B-Q4_K_M.gguf",
+        "size": "5.2 GB",
     },
     {
-        "id":   "qwen2.5-7b",
-        "name": "Qwen2.5-7B Instruct  (multilingual)",
-        "desc": "Official Qwen release. Proven CJK quality, works well for all language pairs.",
-        "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
-        "options": [
-            {"label": "Q4_K_M — 4.7 GB  (recommended)",
-             "filename": "qwen2.5-7b-instruct-q4_k_m.gguf", "size_gb": 4.7},
-            {"label": "Q8_0 — 7.7 GB  (best quality)",
-             "filename": "qwen2.5-7b-instruct-q8_0.gguf", "size_gb": 7.7},
-        ],
+        "name": "Qwen2.5 7B  (Q4_K_M)",
+        "desc": "Proven multilingual quality. Good for Japanese/Chinese to English.",
+        "repo": "bartowski/Qwen2.5-7B-Instruct-GGUF",
+        "file": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+        "size": "4.7 GB",
     },
     {
-        "id":   "vntl-llama3-8b",
-        "name": "VNTL LLaMA3 8B  (JP → EN specialist)",
-        "desc": "Fine-tuned on visual novel and manga dialogue.",
-        "repo": "lmg-anon/vntl-llama3-8b-v2-gguf",
-        "options": [
-            {"label": "Q5_K_M — 5.7 GB  (recommended)",
-             "filename": "vntl-llama3-8b-v2.Q5_K_M.gguf", "size_gb": 5.7},
-        ],
+        "name": "Qwen2.5 7B Abliterated  (Q4_K_M)  — uncensored",
+        "desc": "No safety restrictions. Use for adult manga content.",
+        "repo": "mradermacher/Qwen2.5-7B-Instruct-abliterated-GGUF",
+        "file": "Qwen2.5-7B-Instruct-abliterated.Q4_K_M.gguf",
+        "size": "4.7 GB",
     },
     {
-        "id":   "qwen3.5-9b-uncensored",
-        "name": "Qwen3.5-9B Uncensored  (multilingual)",
-        "desc": "Abliterated variant — no content refusals. Good for mature manga. All language pairs.",
-        "repo": "lukey03/Qwen3.5-9B-abliterated-GGUF",
-        "options": [
-            {"label": "Q4_K_M — 5.5 GB  (recommended)",
-             "filename": "Qwen3.5-9B-abliterated-Q4_K_M.gguf", "size_gb": 5.5},
-        ],
+        "name": "LLaMA 3.1 8B Abliterated  (Q4_K_M)  — uncensored",
+        "desc": "Uncensored LLaMA 3.1. Good uncensored fallback for non-CJK pairs.",
+        "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-abliterated-GGUF",
+        "file": "Meta-Llama-3.1-8B-Instruct-abliterated-Q4_K_M.gguf",
+        "size": "4.9 GB",
     },
-]
-
-# Models that download automatically on first use — shown as info in the dialog
-AUTO_DOWNLOAD_INFO = [
-    ("NLLB-200 (600M)",
-     "Select 'NLLB (Offline)' — downloads ~2.4 GB to HuggingFace cache on first use."),
-    ("OPUS-MT (MarianMT)",
-     "Select 'OPUS-MT (Offline)' — downloads ~350 MB per language pair on first use."),
-    ("manga-ocr",
-     "Select 'Japanese (Manga OCR)' as source — downloads ~450 MB on first use."),
-    ("EasyOCR",
-     "All other OCR sources — language models download automatically on first use."),
 ]
 
 
@@ -139,46 +100,126 @@ AUTO_DOWNLOAD_INFO = [
 
 class ImageViewer(QLabel):
     """
-    A QLabel that scales its image to fill the widget while keeping aspect ratio.
-    Placed inside a QScrollArea so large images can still be scrolled.
+    Zoomable image label inside a QScrollArea.
+    - Fit mode (default): image scales to fill the available area.
+    - Zoom mode: Ctrl+scroll to zoom in/out; double-click to return to fit.
     """
 
     def __init__(self, placeholder="No image"):
         super().__init__()
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(300, 300)
+        self.setMinimumSize(50, 50)
         self.setStyleSheet("background-color: #1e1e1e; color: #666; font-size: 14px;")
         self.setText(placeholder)
-        self._pixmap_original = None  # full-res pixmap, kept for clean rescaling
+        self._pixmap_original = None
+        self._zoom     = 1.0
+        self._fit_mode = True
+        self._pan_start  = None
+        self._pan_hval   = 0
+        self._pan_vval   = 0
 
     def set_image_path(self, path):
-        """Load from a file path string."""
         self._pixmap_original = QPixmap(str(path))
+        self._fit_mode = True
         self._refresh()
 
     def set_pil_image(self, pil_img):
-        """Load from a PIL Image object (used for the translated result)."""
-        rgb = pil_img.convert("RGB")
+        rgb  = pil_img.convert("RGB")
         data = rgb.tobytes("raw", "RGB")
         qimg = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format_RGB888)
         self._pixmap_original = QPixmap.fromImage(qimg)
+        self._fit_mode = True
         self._refresh()
 
     def clear(self):
         self._pixmap_original = None
         self.setText("No image")
 
+    # ── zoom helpers ── #
+
+    def _scroll_area(self):
+        vp = self.parentWidget()
+        if vp:
+            sa = vp.parentWidget()
+            if isinstance(sa, QScrollArea):
+                return sa
+        return None
+
     def _refresh(self):
-        """Scale the stored pixmap to the current widget size."""
-        if self._pixmap_original:
+        if not self._pixmap_original:
+            return
+        sa = self._scroll_area()
+        if self._fit_mode:
+            if sa and not sa.widgetResizable():
+                sa.setWidgetResizable(True)
             scaled = self._pixmap_original.scaled(
                 self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
             )
-            super().setPixmap(scaled)
+            self.setCursor(Qt.ArrowCursor)
+        else:
+            if sa and sa.widgetResizable():
+                sa.setWidgetResizable(False)
+            zw = max(1, int(self._pixmap_original.width()  * self._zoom))
+            zh = max(1, int(self._pixmap_original.height() * self._zoom))
+            scaled = self._pixmap_original.scaled(
+                zw, zh, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            )
+            self.resize(scaled.width(), scaled.height())
+            self.setCursor(Qt.OpenHandCursor)
+        super().setPixmap(scaled)
+
+    def wheelEvent(self, event):
+        if self._pixmap_original and (event.modifiers() & Qt.ControlModifier):
+            self._fit_mode = False
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self._zoom = max(0.1, min(8.0, self._zoom * factor))
+            self._refresh()
+            event.accept()
+        else:
+            event.ignore()  # let the scroll area handle normal scrolling
+
+    def mousePressEvent(self, event):
+        if not self._fit_mode and self._pixmap_original and \
+                event.button() in (Qt.LeftButton, Qt.MiddleButton):
+            self._pan_start = event.globalPosition().toPoint()
+            sa = self._scroll_area()
+            if sa:
+                self._pan_hval = sa.horizontalScrollBar().value()
+                self._pan_vval = sa.verticalScrollBar().value()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_start is not None:
+            delta = event.globalPosition().toPoint() - self._pan_start
+            sa = self._scroll_area()
+            if sa:
+                sa.horizontalScrollBar().setValue(self._pan_hval - delta.x())
+                sa.verticalScrollBar().setValue(self._pan_vval - delta.y())
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._pan_start is not None:
+            self._pan_start = None
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self._pixmap_original:
+            self._pan_start = None
+            self._fit_mode = True
+            self._zoom = 1.0
+            self._refresh()
 
     def resizeEvent(self, event):
-        # Re-scale whenever the widget is resized (e.g. user drags the splitter)
-        self._refresh()
+        if self._fit_mode:
+            self._refresh()
         super().resizeEvent(event)
 
 
@@ -234,6 +275,9 @@ class RegionCanvas(QWidget):
 
     def get_regions(self):
         return self._regions
+
+    def get_selected(self):
+        return self._selected
 
     def delete_selected(self):
         if 0 <= self._selected < len(self._regions):
@@ -438,13 +482,18 @@ class TextEditDialog(QDialog):
         self.setMinimumSize(960, 640)
         self.resize(1200, 760)
 
-        self._base_img   = base_img
+        self._base_img    = base_img
         self._target_lang = target_lang
-        self._pipeline   = None   # lazy-loaded for re-rendering
-        self.result_image = None  # set on Save
+        self._pipeline    = None
+        self.result_image = None
 
-        # Work on a deep copy so Cancel truly discards everything
         self._regions = [dict(r) for r in regions]
+
+        # Debounce timer — updates the canvas preview 400 ms after the last edit
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(400)
+        self._preview_timer.timeout.connect(self._update_preview)
 
         self._build_ui()
         self._refresh_table()
@@ -547,6 +596,7 @@ class TextEditDialog(QDialog):
     # ── table helpers ── #
 
     def _refresh_table(self):
+        prev_sel = self._canvas.get_selected()
         self._table.blockSignals(True)
         self._table.setRowCount(len(self._regions))
         for i, r in enumerate(self._regions):
@@ -561,6 +611,12 @@ class TextEditDialog(QDialog):
             self._table.setCellWidget(i, 2, spin)
         self._table.blockSignals(False)
         self._canvas.set_regions(self._regions)
+        # Restore selection so move/resize/delete don't lose the active box
+        if 0 <= prev_sel < len(self._regions):
+            self._canvas.set_selected(prev_sel)
+            self._table.blockSignals(True)
+            self._table.selectRow(prev_sel)
+            self._table.blockSignals(False)
 
     def _collect_from_table(self):
         """Push table edits back into self._regions."""
@@ -586,15 +642,18 @@ class TextEditDialog(QDialog):
     def _on_table_item_changed(self, item):
         if item.column() == 1 and 0 <= item.row() < len(self._regions):
             self._regions[item.row()]['text'] = item.text()
+            self._preview_timer.start()
 
     def _on_size_changed(self, idx, value):
         if 0 <= idx < len(self._regions):
             self._regions[idx]['font_size'] = value
+            self._preview_timer.start()
 
     def _on_regions_changed(self):
         # A box was added, moved, or resized via the canvas
         self._collect_from_table()
         self._refresh_table()
+        self._preview_timer.start()
 
     def _delete_selected(self):
         self._collect_from_table()
@@ -620,8 +679,15 @@ class TextEditDialog(QDialog):
         self._canvas.set_image(img)
 
     def _save_and_close(self):
+        self._preview_timer.stop()
         self._collect_from_table()
-        self.result_image = self._get_pipeline().render_from_regions(self._base_img, self._regions)
+        try:
+            self.result_image = self._get_pipeline().render_from_regions(
+                self._base_img, self._regions
+            )
+        except Exception as e:
+            print(f"[TextEditDialog] Render error: {e}")
+            import traceback; traceback.print_exc()
         self.accept()
 
 
@@ -697,31 +763,24 @@ class ZonePickDialog(QDialog):
         return [r['bbox'] for r in self._canvas.get_regions()]
 
 
-# ── Model row widget (one entry in the Model Manager) ───────────────────── #
+# ── Model row widget (one entry in the GGUF Model Manager) ──────────────── #
 
 class ModelRowWidget(QWidget):
-    """
-    Shows one GGUF model with a quantization picker, status label, progress bar,
-    and a Download / Cancel / Use button.  Manages its own download thread.
-    """
-    use_requested = Signal(str)   # absolute local path, emitted on "Use This Model"
+    use_requested = Signal(str)   # path to the downloaded .gguf file
 
-    def __init__(self, info: dict, models_dir: Path, parent=None):
+    def __init__(self, info: dict, models_dir: str, parent=None):
         super().__init__(parent)
         self._info       = info
         self._models_dir = models_dir
         self._worker     = None
+        self._btn_connected = False
         self._build_ui()
 
-    # ── helpers ── #
+    def _dest_path(self) -> str:
+        return str(Path(self._models_dir) / self._info["file"])
 
-    def _opt(self) -> dict:
-        return self._info["options"][self._combo.currentIndex()]
-
-    def _local_path(self) -> Path:
-        return self._models_dir / self._opt()["filename"]
-
-    # ── UI ── #
+    def _is_downloaded(self) -> bool:
+        return Path(self._dest_path()).exists()
 
     def _build_ui(self):
         outer = QHBoxLayout(self)
@@ -729,22 +788,18 @@ class ModelRowWidget(QWidget):
 
         info_col = QVBoxLayout()
         name_lbl = QLabel(f"<b>{self._info['name']}</b>")
+        repo_lbl = QLabel(f"<small>{self._info['repo']}</small>")
+        repo_lbl.setStyleSheet("color: #888; font-size: 10px;")
         desc_lbl = QLabel(self._info["desc"])
         desc_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
         desc_lbl.setWordWrap(True)
-        info_col.addWidget(name_lbl)
-        info_col.addWidget(desc_lbl)
+        for w in (name_lbl, repo_lbl, desc_lbl):
+            info_col.addWidget(w)
         info_w = QWidget(); info_w.setLayout(info_col)
         outer.addWidget(info_w, stretch=3)
 
         right_col = QVBoxLayout()
         right_col.setSpacing(4)
-
-        self._combo = QComboBox()
-        for opt in self._info["options"]:
-            self._combo.addItem(opt["label"])
-        self._combo.currentIndexChanged.connect(self._refresh_state)
-        right_col.addWidget(self._combo)
 
         self._status_lbl = QLabel()
         self._status_lbl.setStyleSheet("font-size: 11px;")
@@ -758,23 +813,21 @@ class ModelRowWidget(QWidget):
 
         self._btn = QPushButton()
         self._btn.setFixedHeight(28)
-        self._btn_connected = False
         right_col.addWidget(self._btn)
         right_col.addStretch()
 
-        right_w = QWidget(); right_w.setFixedWidth(260); right_w.setLayout(right_col)
+        right_w = QWidget(); right_w.setFixedWidth(220); right_w.setLayout(right_col)
         outer.addWidget(right_w)
 
         self._refresh_state()
 
     def _refresh_state(self):
-        if self._local_path().exists():
-            self._status_lbl.setText("✓  Downloaded")
+        if self._is_downloaded():
+            self._status_lbl.setText("Downloaded")
             self._status_lbl.setStyleSheet("color: #5a9e5a; font-size: 11px; font-weight: bold;")
             self._set_btn("Use This Model", self._use_current)
         else:
-            gb = self._opt()["size_gb"]
-            self._status_lbl.setText(f"Not downloaded  ({gb} GB)")
+            self._status_lbl.setText(f"Not downloaded  ({self._info['size']})")
             self._status_lbl.setStyleSheet("color: #aaa; font-size: 11px;")
             self._set_btn("Download", self._start_download)
 
@@ -785,28 +838,24 @@ class ModelRowWidget(QWidget):
         self._btn.clicked.connect(slot)
         self._btn_connected = True
 
-    # ── actions ── #
-
     def _use_current(self):
-        self.use_requested.emit(str(self._local_path()))
+        self.use_requested.emit(self._dest_path())
 
     def _start_download(self):
         from app.worker import ModelDownloadWorker
-        self._models_dir.mkdir(parents=True, exist_ok=True)
-        self._worker = ModelDownloadWorker(
-            self._info["repo"], self._opt()["filename"], str(self._models_dir)
-        )
+        url = (f"https://huggingface.co/{self._info['repo']}"
+               f"/resolve/main/{self._info['file']}")
+        self._worker = ModelDownloadWorker(url, self._dest_path())
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_done)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-        self._status_lbl.setText("Starting download…")
+        self._status_lbl.setText("Downloading…")
         self._status_lbl.setStyleSheet("color: #4a8eff; font-size: 11px;")
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
         self._progress.setVisible(True)
-        self._combo.setEnabled(False)
         self._set_btn("Cancel", self._cancel)
 
     def _cancel(self):
@@ -814,56 +863,46 @@ class ModelRowWidget(QWidget):
             self._worker.stop()
             self._worker = None
         self._progress.setVisible(False)
-        self._combo.setEnabled(True)
         self._refresh_state()
 
-    def _on_progress(self, downloaded: int, total: int):
+    def _on_progress(self, done: int, total: int):
         if total > 0:
-            self._progress.setValue(int(downloaded * 100 / total))
-            self._status_lbl.setText(f"Downloading…  {downloaded} / {total} MB")
+            self._progress.setValue(int(done * 100 / total))
+            self._status_lbl.setText(f"Downloading…  {done} / {total} MB")
         else:
             self._progress.setRange(0, 0)
-            self._status_lbl.setText(f"Downloading…  {downloaded} MB")
 
-    def _on_done(self, _):
+    def _on_done(self, path: str):
         self._worker = None
         self._progress.setVisible(False)
-        self._combo.setEnabled(True)
         self._refresh_state()
 
     def _on_error(self, msg: str):
         self._worker = None
         self._progress.setVisible(False)
-        self._combo.setEnabled(True)
-        self._status_lbl.setText("Download failed — see details below")
+        self._status_lbl.setText("Download failed")
         self._status_lbl.setStyleSheet("color: #cc4444; font-size: 11px;")
         self._set_btn("Retry", self._start_download)
         QMessageBox.warning(
-            self,
-            "Download failed",
-            f"Could not download {self._opt()['filename']}.\n\n{msg}\n\n"
-            f"You can download the file manually from:\n"
-            f"https://huggingface.co/{self._info['repo']}\n"
-            f"then use the Browse button in settings to select it.",
+            self, "Download failed",
+            f"Could not download {self._info['file']}.\n\n{msg}\n\n"
+            "The file may have been renamed on HuggingFace. Open the repo link below,\n"
+            "download the Q4_K_M file manually, then use the Browse button in settings\n"
+            "to point the app at it.\n\n"
+            f"Repo: https://huggingface.co/{self._info['repo']}"
         )
 
 
-# ── Model Manager dialog ─────────────────────────────────────────────────── #
+# ── Model Manager dialog (GGUF) ──────────────────────────────────────────── #
 
 class ModelManagerDialog(QDialog):
-    """
-    Lists all curated GGUF models with quantization options, download progress,
-    and a 'Use This Model' button that auto-fills the GGUF path in settings.
-    Also lists auto-download models (NLLB, OPUS-MT, etc.) for reference.
-    """
-
-    def __init__(self, parent=None, models_dir: Path | None = None):
+    def __init__(self, parent=None, models_dir: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("Model Manager")
-        self.setMinimumSize(760, 540)
-        self.resize(900, 660)
+        self.setWindowTitle("Model Manager — Local GGUF")
+        self.setMinimumSize(720, 500)
+        self.resize(860, 640)
         self.chosen_path: str | None = None
-        self._models_dir = models_dir or (_settings.APPDATA_DIR / "models")
+        self._models_dir = models_dir
         self._build_ui()
 
     def _build_ui(self):
@@ -871,16 +910,12 @@ class ModelManagerDialog(QDialog):
         layout.setSpacing(10)
 
         hdr = QLabel(
-            "<b>Local LLM Models (GGUF)</b><br>"
-            "Download once — translate offline forever, no API key needed.<br>"
-            "After downloading, click <i>Use This Model</i> to auto-fill the path in settings.<br>"
-            "<span style='color:#aaa;'>Prerequisite: <code>pip install llama-cpp-python</code>"
-            " &nbsp;|&nbsp; GPU build: "
-            "<code>pip install llama-cpp-python --extra-index-url "
-            "https://abetlen.github.io/llama-cpp-python/whl/cu121</code></span>"
+            "<b>Recommended models</b> — click <i>Download</i> to fetch from HuggingFace, "
+            "then <i>Use This Model</i> to select it.  "
+            "If a download fails with 404, the filename may have changed — "
+            "download manually from the repo link and use <i>Browse existing file…</i> below."
         )
         hdr.setWordWrap(True)
-        hdr.setTextFormat(Qt.RichText)
         layout.addWidget(hdr)
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
@@ -910,30 +945,30 @@ class ModelManagerDialog(QDialog):
         sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine); sep2.setFrameShadow(QFrame.Sunken)
         layout.addWidget(sep2)
 
-        auto_hdr = QLabel("<b>Auto-download models</b> — no action needed, these install on first use:")
-        layout.addWidget(auto_hdr)
-
-        for name, desc in AUTO_DOWNLOAD_INFO:
-            lbl = QLabel(f"  &bull;  <b>{name}</b>  —  {desc}")
-            lbl.setStyleSheet("color: #bbb; font-size: 11px;")
-            lbl.setWordWrap(True)
-            lbl.setTextFormat(Qt.RichText)
-            layout.addWidget(lbl)
-
-        sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine); sep3.setFrameShadow(QFrame.Sunken)
-        layout.addWidget(sep3)
-
         brow = QHBoxLayout()
-        brow.addStretch()
-        btn_close = QPushButton("Close")
+        btn_browse = QPushButton("Browse existing .gguf file…")
+        btn_browse.clicked.connect(self._browse_existing)
+        btn_close  = QPushButton("Close")
         btn_close.setFixedHeight(32)
-        btn_close.clicked.connect(self.accept)
+        btn_browse.setFixedHeight(32)
+        btn_close.clicked.connect(self.reject)
+        brow.addWidget(btn_browse)
+        brow.addStretch()
         brow.addWidget(btn_close)
         layout.addLayout(brow)
 
     def _on_use(self, path: str):
         self.chosen_path = path
         self.accept()
+
+    def _browse_existing(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select GGUF model file", self._models_dir,
+            "GGUF models (*.gguf)"
+        )
+        if path:
+            self.chosen_path = path
+            self.accept()
 
 
 # ── Main window ─────────────────────────────────────────────────────────── #
@@ -1052,10 +1087,27 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._build_settings_group())
 
-        # Progress bar — hidden until a translation job starts
+        # Progress panel — hidden until a translation job starts
+        self._progress_panel = QWidget()
+        self._progress_panel.setVisible(False)
+        prog_layout = QVBoxLayout(self._progress_panel)
+        prog_layout.setContentsMargins(0, 4, 0, 2)
+        prog_layout.setSpacing(2)
+
+        self._progress_file_lbl = QLabel()
+        self._progress_file_lbl.setStyleSheet("font-size: 11px; color: #ccc;")
+        prog_layout.addWidget(self._progress_file_lbl)
+
+        self._progress_step_lbl = QLabel()
+        self._progress_step_lbl.setStyleSheet("font-size: 11px; color: #4a8eff;")
+        prog_layout.addWidget(self._progress_step_lbl)
+
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setTextVisible(False)
+        prog_layout.addWidget(self.progress_bar)
+
+        layout.addWidget(self._progress_panel)
 
         return panel
 
@@ -1079,35 +1131,15 @@ class MainWindow(QMainWindow):
         self.svc_combo.currentTextChanged.connect(self._on_service_changed)
         g.addWidget(self.svc_combo)
 
-        # DeepL API key row — only shown when "DeepL" is selected
-        self.deepl_label = QLabel("DeepL API Key:")
-        self.deepl_input = QLineEdit()
-        self.deepl_input.setPlaceholderText("Paste free API key here…")
-        self.deepl_input.setEchoMode(QLineEdit.Password)
-        self.deepl_label.hide()
-        self.deepl_input.hide()
-        g.addWidget(self.deepl_label)
-        g.addWidget(self.deepl_input)
-
-        # Local LLM (GGUF) settings — only shown when that service is selected
-        self.gguf_label = QLabel("GGUF model file:")
-        self.gguf_hint  = QLabel(
-            "Use <b>Manage Models</b> to download a model, or browse to a .gguf file you already have.<br>"
-            "<span style='color:#888;'>Needs: <code>pip install llama-cpp-python</code></span>"
+        # GGUF / Local LLM settings — only shown when "Local LLM (GGUF)" is selected
+        self.gguf_hint = QLabel(
+            "Requires <b>llama-cpp-python</b>.  "
+            "CPU: <code>pip install llama-cpp-python</code><br>"
+            "GPU: add <code>--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121</code>"
         )
         self.gguf_hint.setWordWrap(True)
-        self.gguf_hint.setOpenExternalLinks(True)
-        self.gguf_hint.setStyleSheet("color: #aaa; font-size: 11px;")
-
-        self.models_dir_label = QLabel("Models folder:")
-        self.models_dir_edit  = QLineEdit()
-        self.models_dir_edit.setPlaceholderText("Folder where models are saved…")
-        self.models_dir_browse = QPushButton("…")
-        self.models_dir_browse.setFixedWidth(28)
-        self.models_dir_browse.clicked.connect(self._browse_models_dir)
-        models_dir_row = QHBoxLayout()
-        models_dir_row.addWidget(self.models_dir_edit)
-        models_dir_row.addWidget(self.models_dir_browse)
+        self.gguf_hint.setTextFormat(Qt.RichText)
+        self.gguf_hint.setStyleSheet("color: #aaa; font-size: 10px;")
 
         self.gguf_manage_btn = QPushButton("Manage Models…")
         self.gguf_manage_btn.setStyleSheet(
@@ -1116,37 +1148,41 @@ class MainWindow(QMainWindow):
         self.gguf_manage_btn.setFixedHeight(28)
         self.gguf_manage_btn.clicked.connect(lambda: self._open_model_manager())
 
-        self.gguf_input = QLineEdit()
-        self.gguf_input.setPlaceholderText("C:\\path\\to\\model-Q4_K_M.gguf")
-        gguf_row = QHBoxLayout()
-        self.gguf_browse = QPushButton("…")
-        self.gguf_browse.setFixedWidth(28)
-        self.gguf_browse.clicked.connect(self._browse_gguf)
-        gguf_row.addWidget(self.gguf_input)
-        gguf_row.addWidget(self.gguf_browse)
+        self.gguf_models_label = QLabel("Models folder:")
+        models_row = QHBoxLayout()
+        self.gguf_models_edit = QLineEdit()
+        self.gguf_models_edit.setPlaceholderText("AppData/Roaming/ComicTranslator/models")
+        btn_browse_models = QPushButton("…")
+        btn_browse_models.setFixedWidth(28)
+        btn_browse_models.clicked.connect(self._browse_models_dir)
+        models_row.addWidget(self.gguf_models_edit)
+        models_row.addWidget(btn_browse_models)
+        self._gguf_models_row_widget = QWidget()
+        self._gguf_models_row_widget.setLayout(models_row)
+
+        self.gguf_file_label = QLabel("GGUF model file:")
+        file_row = QHBoxLayout()
+        self.gguf_file_edit = QLineEdit()
+        self.gguf_file_edit.setPlaceholderText("(none selected)")
+        btn_browse_gguf = QPushButton("…")
+        btn_browse_gguf.setFixedWidth(28)
+        btn_browse_gguf.clicked.connect(self._browse_gguf)
+        file_row.addWidget(self.gguf_file_edit)
+        file_row.addWidget(btn_browse_gguf)
+        self._gguf_file_row_widget = QWidget()
+        self._gguf_file_row_widget.setLayout(file_row)
 
         self.gguf_gpu_label = QLabel("GPU layers (0 = CPU only):")
-        self.gguf_gpu_spin  = QSpinBox()
-        self.gguf_gpu_spin.setRange(0, 200)
+        self.gguf_gpu_spin = QSpinBox()
+        self.gguf_gpu_spin.setRange(0, 999)
         self.gguf_gpu_spin.setValue(0)
-        self.gguf_gpu_spin.setToolTip(
-            "Set to 999 to fully offload to GPU (requires CUDA build of llama-cpp-python). "
-            "Leave at 0 for CPU-only inference."
-        )
-        gguf_gpu_row = QHBoxLayout()
-        gguf_gpu_row.addWidget(self.gguf_gpu_spin)
-        gguf_gpu_row.addStretch()
+        self.gguf_gpu_spin.setToolTip("Number of model layers to offload to GPU. 999 = fully on GPU.")
 
-        for w in (self.gguf_label, self.gguf_hint,
-                  self.models_dir_label, self.gguf_manage_btn):
+        for w in (self.gguf_hint, self.gguf_manage_btn,
+                  self.gguf_models_label, self._gguf_models_row_widget,
+                  self.gguf_file_label, self._gguf_file_row_widget,
+                  self.gguf_gpu_label, self.gguf_gpu_spin):
             w.hide(); g.addWidget(w)
-        self.models_dir_edit.hide(); self.models_dir_browse.hide()
-        g.addLayout(models_dir_row)
-        self.gguf_input.hide(); self.gguf_browse.hide()
-        g.addLayout(gguf_row)
-        self.gguf_gpu_label.hide(); g.addWidget(self.gguf_gpu_label)
-        g.addLayout(gguf_gpu_row)
-        self.gguf_gpu_spin.hide()
 
         g.addWidget(QLabel("Output Folder:"))
         out_row = QHBoxLayout()
@@ -1165,6 +1201,11 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(4, 0, 0, 0)
+
+        zoom_hint = QLabel("Ctrl+scroll to zoom  •  Double-click to fit")
+        zoom_hint.setStyleSheet("color: #555; font-size: 10px;")
+        zoom_hint.setAlignment(Qt.AlignRight)
+        layout.addWidget(zoom_hint)
 
         # Two tabs: original and translated side by side for easy comparison
         self.tabs = QTabWidget()
@@ -1281,21 +1322,21 @@ class MainWindow(QMainWindow):
             idx = combo.findText(cfg[key])
             if idx >= 0:
                 combo.setCurrentIndex(idx)
-        self.deepl_input.setText(cfg["deepl_key"])
-        self.gguf_input.setText(cfg["gguf_path"])
-        self.gguf_gpu_spin.setValue(cfg["gguf_gpu_layers"])
-        self.models_dir_edit.setText(cfg["models_dir"])
+        from app import settings as _s
+        self.gguf_models_edit.setText(cfg.get("models_dir", str(_s.APPDATA_DIR / "models")))
+        self.gguf_file_edit.setText(cfg.get("gguf_path", ""))
+        self.gguf_gpu_spin.setValue(int(cfg.get("gguf_gpu_layers", 0)))
         self.output_edit.setText(cfg["output_dir"])
 
     def _collect_settings(self) -> dict:
+        from app import settings as _s
         return {
             "source_lang":     self.src_combo.currentText(),
             "target_lang":     self.tgt_combo.currentText(),
             "service":         self.svc_combo.currentText(),
-            "deepl_key":       self.deepl_input.text(),
-            "gguf_path":       self.gguf_input.text(),
+            "models_dir":      self.gguf_models_edit.text() or str(_s.APPDATA_DIR / "models"),
+            "gguf_path":       self.gguf_file_edit.text(),
             "gguf_gpu_layers": self.gguf_gpu_spin.value(),
-            "models_dir":      self.models_dir_edit.text(),
             "output_dir":      self.output_edit.text(),
         }
 
@@ -1304,40 +1345,37 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _on_service_changed(self, text):
-        show_deepl = (text == "DeepL (API Key)")
-        show_gguf  = (text == "Local LLM (GGUF)")
-        self.deepl_label.setVisible(show_deepl)
-        self.deepl_input.setVisible(show_deepl)
-        for w in (self.gguf_label, self.gguf_hint,
-                  self.models_dir_label, self.models_dir_edit, self.models_dir_browse,
-                  self.gguf_manage_btn,
-                  self.gguf_input, self.gguf_browse,
+        show_gguf = (text == "Local LLM (GGUF)")
+        for w in (self.gguf_hint, self.gguf_manage_btn,
+                  self.gguf_models_label, self._gguf_models_row_widget,
+                  self.gguf_file_label, self._gguf_file_row_widget,
                   self.gguf_gpu_label, self.gguf_gpu_spin):
             w.setVisible(show_gguf)
 
-    def _browse_models_dir(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Select models folder", self.models_dir_edit.text()
-        )
-        if folder:
-            self.models_dir_edit.setText(folder)
-
-    def _browse_gguf(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select GGUF model file", self.models_dir_edit.text(),
-            "GGUF model (*.gguf);;All files (*)"
-        )
-        if path:
-            self.gguf_input.setText(path)
-
     def _open_model_manager(self):
-        models_dir = Path(self.models_dir_edit.text())
-        dlg = ModelManagerDialog(self, models_dir)
+        models_dir = self.gguf_models_edit.text().strip()
+        if not models_dir:
+            from app import settings as _s
+            models_dir = str(_s.APPDATA_DIR / "models")
+        dlg = ModelManagerDialog(self, models_dir=models_dir)
         if dlg.exec() == QDialog.Accepted and dlg.chosen_path:
-            self.gguf_input.setText(dlg.chosen_path)
+            self.gguf_file_edit.setText(dlg.chosen_path)
             self.statusBar().showMessage(
                 f"Model set: {Path(dlg.chosen_path).name}  — ready to translate."
             )
+
+    def _browse_models_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select models folder")
+        if folder:
+            self.gguf_models_edit.setText(folder)
+
+    def _browse_gguf(self):
+        start = self.gguf_models_edit.text().strip() or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select GGUF model file", start, "GGUF models (*.gguf)"
+        )
+        if path:
+            self.gguf_file_edit.setText(path)
 
     # ------------------------------------------------------------------ #
     # Translation control                                                  #
@@ -1394,9 +1432,19 @@ class MainWindow(QMainWindow):
             if zones:
                 self.manual_zones[path] = zones
                 n = len(zones)
-                self.statusBar().showMessage(
-                    f"Saved {n} zone(s) for {Path(path).name} — translate this file to apply them."
+                reply = QMessageBox.question(
+                    self, "Zones saved",
+                    f"Saved {n} zone(s) for {Path(path).name}.\n\n"
+                    "Re-translate this file now to apply them?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
                 )
+                if reply == QMessageBox.Yes:
+                    self._start_translation(files=[path])
+                else:
+                    self.statusBar().showMessage(
+                        f"Saved {n} zone(s) — click Translate Selected to apply them."
+                    )
             else:
                 self.manual_zones.pop(path, None)
                 self.statusBar().showMessage("All zones cleared.")
@@ -1414,8 +1462,10 @@ class MainWindow(QMainWindow):
 
         ed = self.edit_data[path]
         dlg = TextEditDialog(self, path, ed['base'], ed['regions'], ed['target_lang'])
-        if dlg.exec() == QDialog.Accepted and dlg.result_image:
+        if dlg.exec() == QDialog.Accepted and dlg.result_image is not None:
             self.translated[path] = dlg.result_image
+            # Persist the edited regions so re-opening the dialog shows the correct state
+            self.edit_data[path]['regions'] = [dict(r) for r in dlg._regions]
             # Refresh preview if this file is still selected
             row = self.list_widget.currentRow()
             if 0 <= row < len(self.file_list) and self.file_list[row] == path:
@@ -1435,13 +1485,14 @@ class MainWindow(QMainWindow):
             "source_lang":     SOURCE_LANGUAGES[self.src_combo.currentText()],
             "target_lang":     TARGET_LANGUAGES[self.tgt_combo.currentText()],
             "service":         self.svc_combo.currentText(),
-            "deepl_key":       self.deepl_input.text(),
-            "gguf_path":       self.gguf_input.text(),
+            "gguf_path":       self.gguf_file_edit.text().strip(),
             "gguf_gpu_layers": self.gguf_gpu_spin.value(),
             "manual_zones":    self.manual_zones,
         }
 
-        self.progress_bar.setVisible(True)
+        self._progress_panel.setVisible(True)
+        self._progress_file_lbl.setText("Starting…")
+        self._progress_step_lbl.setText("")
         self.progress_bar.setRange(0, len(files))
         self.progress_bar.setValue(0)
 
@@ -1450,12 +1501,13 @@ class MainWindow(QMainWindow):
         self.btn_add_files.setEnabled(False)
         self.btn_add_folder.setEnabled(False)
 
-        # Create and start the worker thread
         self.worker = TranslationWorker(files, settings)
         self.worker.progress.connect(self._on_progress)
+        self.worker.step.connect(self._on_step)
         self.worker.image_done.connect(self._on_image_done)
         self.worker.finished.connect(self._on_finished)
         self.worker.error.connect(self._on_error)
+        self.worker.fatal_error.connect(self._on_fatal_error)
         self.worker.start()
 
     def _stop_translation(self):
@@ -1469,7 +1521,12 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, count, message):
         self.progress_bar.setValue(count)
+        self._progress_file_lbl.setText(message)
+        self._progress_step_lbl.setText("")
         self.statusBar().showMessage(message)
+
+    def _on_step(self, stage):
+        self._progress_step_lbl.setText(f"  ↳  {stage}" if stage else "")
 
     def _on_image_done(self, path, payload):
         """Called each time a single image finishes — update preview if it's selected."""
@@ -1495,7 +1552,7 @@ class MainWindow(QMainWindow):
         self.btn_translate.setText("Translate All")
         self.btn_add_files.setEnabled(True)
         self.btn_add_folder.setEnabled(True)
-        self.progress_bar.setVisible(False)
+        self._progress_panel.setVisible(False)
         row = self.list_widget.currentRow()
         if 0 <= row < len(self.file_list):
             self.btn_translate_one.setEnabled(True)
@@ -1503,8 +1560,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Finished — {n} image(s) translated. Click 'Edit Texts' to adjust, then Save All.")
 
     def _on_error(self, msg):
-        # Non-fatal errors appear in the status bar so we don't spam the user with popups
         self.statusBar().showMessage(f"⚠  {msg}")
+
+    def _on_fatal_error(self, msg):
+        QMessageBox.critical(self, "Translation Error", msg)
 
     # ------------------------------------------------------------------ #
     # Saving                                                              #

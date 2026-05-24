@@ -15,57 +15,12 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 
-# Maps our friendly language-selector codes to the format each translator expects.
 GOOGLE_TARGET_CODES = {
     "en":    "en",
     "ja":    "ja",
     "ko":    "ko",
     "zh-CN": "zh-CN",
     "zh-TW": "zh-TW",
-    "es":    "es",
-    "fr":    "fr",
-    "de":    "de",
-    "pt":    "pt",
-    "ru":    "ru",
-    "it":    "it",
-    "vi":    "vi",
-    "th":    "th",
-}
-
-# MyMemory needs locale-style codes like 'ja-JP'
-# ch_sim / ch_tra are EasyOCR internal codes; MyMemory uses zh-CN / zh-TW
-MYMEMORY_CODES = {
-    "en":     "en-US",
-    "ja":     "ja-JP",
-    "ko":     "ko-KR",
-    "zh-CN":  "zh-CN",
-    "zh-TW":  "zh-TW",
-    "ch_sim": "zh-CN",
-    "ch_tra": "zh-TW",
-    "es":     "es-ES",
-    "fr":     "fr-FR",
-    "de":     "de-DE",
-    "pt":     "pt-PT",
-    "ru":     "ru-RU",
-    "it":     "it-IT",
-    "vi":     "vi-VN",
-    "th":     "th-TH",
-}
-
-# Argos Translate uses plain ISO codes; no distinction between zh-CN and zh-TW
-ARGOS_SOURCE_CODES = {
-    "ja":     "ja",
-    "ko":     "ko",
-    "ch_sim": "zh",
-    "ch_tra": "zh",
-    "en":     "en",
-}
-ARGOS_TARGET_CODES = {
-    "en":    "en",
-    "ja":    "ja",
-    "ko":    "ko",
-    "zh-CN": "zh",
-    "zh-TW": "zh",
     "es":    "es",
     "fr":    "fr",
     "de":    "de",
@@ -128,104 +83,6 @@ class _ThrottledTranslator:
         return result[0] or ""
 
 
-# ── translators library (no API key) ────────────────────────────────────── #
-
-# Each backend in the `translators` library uses slightly different target codes.
-# Baidu in particular diverges from standard BCP-47 (jp not ja, kor not ko, etc.)
-_EXT_BACKENDS = {
-    "Baidu (Free)": {
-        "backend": "baidu",
-        "targets": {
-            "en": "en",   "ja": "jp",      "ko": "kor",  "zh-CN": "zh",
-            "zh-TW": "cht","es": "spa",    "fr": "fra",  "de": "de",
-            "pt": "pt",   "ru": "ru",      "it": "it",   "vi": "vie",
-            "th": "th",
-        },
-    },
-    "Bing (Free)": {
-        "backend": "bing",
-        "targets": {
-            "en": "en",       "ja": "ja",       "ko": "ko",
-            "zh-CN": "zh-Hans","zh-TW": "zh-Hant","es": "es",
-            "fr": "fr",       "de": "de",       "pt": "pt",
-            "ru": "ru",       "it": "it",       "vi": "vi",
-            "th": "th",
-        },
-    },
-}
-
-
-class ExternalTranslator:
-    """
-    Uses the `translators` library to reach Baidu, Bing, etc. without an API key.
-    The library scrapes the same web endpoints your browser would use, so no
-    registration is required.  Quality matches the real service.
-
-    Caveats:
-      • Requires internet.
-      • Can break if the provider changes their web API (library updates fix this).
-      • First call per session is slow (~2-3 s) while the library initialises cookies.
-    """
-
-    def __init__(self, backend: str, to_code: str):
-        self._backend = backend
-        self._to      = to_code
-
-    def translate(self, text: str) -> str:
-        import translators as ts
-        return ts.translate_text(
-            text,
-            translator=self._backend,
-            from_language="auto",
-            to_language=self._to,
-        ) or ""
-
-
-# ── Argos Translate (offline) ───────────────────────────────────────────── #
-
-class ArgosTranslator:
-    """
-    Offline machine translation using Argos Translate.
-
-    First use for a language pair downloads the model package (~100-300 MB)
-    to the user's Argos data directory — subsequent uses load from cache.
-    No API key, no internet required after the first download, no rate limits.
-
-    Translation quality is generally lower than Google Translate, especially
-    for CJK languages, but it will never block or exhaust a quota.
-    """
-
-    def __init__(self, from_code: str, to_code: str):
-        import argostranslate.package
-        import argostranslate.translate
-
-        self._from = from_code
-        self._to   = to_code
-
-        # Check if this pair is already installed
-        installed = argostranslate.package.get_installed_packages()
-        already = any(p.from_code == from_code and p.to_code == to_code
-                      for p in installed)
-
-        if not already:
-            # Download the package index then install the required pair
-            argostranslate.package.update_package_index()
-            available = argostranslate.package.get_available_packages()
-            pkg = next(
-                (p for p in available
-                 if p.from_code == from_code and p.to_code == to_code),
-                None,
-            )
-            if pkg is None:
-                raise ValueError(
-                    f"Argos Translate has no '{from_code}' → '{to_code}' package.\n"
-                    f"This language pair may not be supported offline yet."
-                )
-            argostranslate.package.install_from_path(pkg.download())
-
-    def translate(self, text: str) -> str:
-        import argostranslate.translate
-        return argostranslate.translate.translate(text, self._from, self._to) or ""
 
 
 # ── RapidOCR wrapper (Chinese OCR) ──────────────────────────────────────── #
@@ -317,32 +174,6 @@ class MangaOCRWrapper:
         return out
 
 
-# ── NLLB offline translator ──────────────────────────────────────────────── #
-
-# Facebook NLLB-200 Flores-200 language codes
-_NLLB_SRC_CODES = {
-    "ja":     "jpn_Jpan",
-    "ja_manga": "jpn_Jpan",
-    "ko":     "kor_Hang",
-    "ch_sim": "zho_Hans",
-    "ch_tra": "zho_Hant",
-    "en":     "eng_Latn",
-}
-_NLLB_TGT_CODES = {
-    "en":    "eng_Latn",
-    "ja":    "jpn_Jpan",
-    "ko":    "kor_Hang",
-    "zh-CN": "zho_Hans",
-    "zh-TW": "zho_Hant",
-    "es":    "spa_Latn",
-    "fr":    "fra_Latn",
-    "de":    "deu_Latn",
-    "pt":    "por_Latn",
-    "ru":    "rus_Cyrl",
-    "it":    "ita_Latn",
-    "vi":    "vie_Latn",
-    "th":    "tha_Thai",
-}
 
 
 # ── OPUS-MT language code maps ───────────────────────────────────────────── #
@@ -454,58 +285,79 @@ _SAKURA_SYSTEM_PROMPT = (
 
 
 class LocalLLMTranslator:
-    """
-    Universal local-LLM translator — loads any GGUF instruction model via
-    llama-cpp-python and translates manga dialogue with an auto-generated system prompt.
-
-    Compatible models (user downloads the .gguf manually):
-      • Qwen3-8B / Qwen3-14B (bartowski or Unsloth GGUF)              ~5–9 GB
-      • Qwen3-8B uncensored / Qwen3.5-9B-abliterated (lukey03 etc.)   ~5 GB
-      • Qwen2.5-7B-Instruct-GGUF (official Qwen)                      ~4–8 GB
-      • Qwen3.6-27B / 35B-A3B (Unsloth GGUF, needs 16+ GB RAM)        ~15–20 GB
-      • SakuraLLM Sakura-1.5B / 7B (JP→ZH specialist)                 ~1–4 GB
-      • Any other instruction-tuned GGUF in ChatML / Qwen format
-
-    Install runtime:  pip install llama-cpp-python
-    GPU acceleration: pip install llama-cpp-python --extra-index-url
-                        https://abetlen.github.io/llama-cpp-python/whl/cu121
-    Pre-built Windows wheels: https://github.com/abetlen/llama-cpp-python/releases
-
-    Qwen3 tip: the model outputs <think>…</think> reasoning by default.
-    This class strips those blocks automatically — you always get only the translation.
-    """
+    """Translates using a local GGUF model via llama-cpp-python."""
 
     def __init__(self, model_path: str, from_ocr_code: str, to_code: str,
                  n_gpu_layers: int = 0):
-        import os, re
-        from llama_cpp import Llama
-
+        import re
         self._re_think = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+        try:
+            from llama_cpp import Llama
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError(
+                "llama-cpp-python is not installed.\n\n"
+                "CPU only:    pip install llama-cpp-python\n"
+                "NVIDIA GPU:  pip install llama-cpp-python "
+                "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"
+            )
+
+        if not model_path or not Path(model_path).exists():
+            raise FileNotFoundError(
+                f"GGUF model file not found:\n{model_path}\n\n"
+                "Use 'Manage Models…' to download one, or browse to an existing .gguf file."
+            )
+
+        print(f"[LocalLLMTranslator] Loading {Path(model_path).name} "
+              f"(gpu_layers={n_gpu_layers})…")
+        try:
+            self._llm = Llama(
+                model_path=str(model_path),
+                n_gpu_layers=n_gpu_layers,
+                n_ctx=2048,
+                verbose=False,
+            )
+        except OSError as e:
+            # 0xc000001d = STATUS_ILLEGAL_INSTRUCTION: llama-cpp-python was compiled
+            # with CPU instructions (usually AVX-512) that this CPU does not support.
+            # Note: 12th/13th gen Intel Core CPUs support AVX2 but NOT AVX-512.
+            if getattr(e, "winerror", None) in (-1073741795, 3221225501):
+                raise RuntimeError(
+                    "CPU instruction error (STATUS_ILLEGAL_INSTRUCTION / 0xc000001d)\n\n"
+                    "The installed llama-cpp-python wheel was compiled with CPU instructions\n"
+                    "(likely AVX-512) that your processor does not support.\n"
+                    "This commonly affects 12th/13th gen Intel Core CPUs, which support AVX2\n"
+                    "but not AVX-512.\n\n"
+                    "Fix option 1 — try the pre-built CPU wheel (easiest):\n"
+                    "  pip install llama-cpp-python --force-reinstall "
+                    "--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu\n\n"
+                    "Fix option 2 — rebuild without AVX-512 "
+                    "(needs CMake + VS Build Tools with C++):\n"
+                    "  set CMAKE_ARGS=-DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF "
+                    "-DGGML_AVX512_VNNI=OFF\n"
+                    "  pip install llama-cpp-python --no-binary llama-cpp-python "
+                    "--force-reinstall\n\n"
+                    "After reinstalling, restart the app."
+                ) from e
+            raise
 
         src_name = _LLM_LANG_NAMES.get(from_ocr_code, from_ocr_code)
         tgt_name = _LLM_LANG_NAMES.get(to_code, to_code)
+        fname    = Path(model_path).name.lower()
 
-        # Auto-select system prompt: Sakura specialist prompt or generic manga prompt
-        fname = os.path.basename(model_path).lower()
         if any(k in fname for k in ("sakura", "galtransl")):
-            self._system = _SAKURA_SYSTEM_PROMPT
+            self._system    = _SAKURA_SYSTEM_PROMPT
             self._user_tmpl = "将下面的日文文本翻译成中文：{text}"
         else:
             self._system = (
                 f"You are a professional manga and comic translator. "
                 f"Translate the following {src_name} text into {tgt_name}. "
-                f"Preserve the tone, emotion, and style of manga dialogue. "
+                f"Preserve tone, emotion, and manga dialogue style. "
                 f"Output ONLY the translated text — no explanations, notes, or alternatives."
             )
             self._user_tmpl = "{text}"
 
-        self._llm = Llama(
-            model_path=model_path,
-            n_ctx=4096,
-            n_threads=max(1, os.cpu_count() - 1),
-            n_gpu_layers=n_gpu_layers,   # set >0 to offload layers to GPU
-            verbose=False,
-        )
+        print("[LocalLLMTranslator] Model loaded.")
 
     def translate(self, text: str) -> str:
         resp = self._llm.create_chat_completion(
@@ -518,106 +370,60 @@ class LocalLLMTranslator:
             max_tokens=512,
         )
         result = resp["choices"][0]["message"]["content"].strip()
-        # Strip Qwen3 chain-of-thought blocks if the model emits them
-        result = self._re_think.sub("", result).strip()
-        return result
+        return self._re_think.sub("", result).strip()
 
 
-class NLLBTranslator:
-    """
-    Fully offline multilingual translation using Facebook NLLB-200-distilled-600M.
-
-    First run downloads ~2.4 GB of model weights to the HuggingFace cache
-    (%USERPROFILE%\\.cache\\huggingface\\).  All subsequent runs load from cache —
-    no internet required.
-
-    Quality is noticeably better than Argos Translate, especially for
-    Japanese → English and Chinese → English.  CPU inference is roughly
-    1–4 seconds per sentence on a modern processor.
-    """
-
-    def __init__(self, from_ocr_code: str, to_code: str):
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-        import torch
-
-        self._torch = torch
-        src = _NLLB_SRC_CODES.get(from_ocr_code, "jpn_Jpan")
-        self._tgt = _NLLB_TGT_CODES.get(to_code, "eng_Latn")
-
-        model_id = "facebook/nllb-200-distilled-600M"
-        self._tokenizer = AutoTokenizer.from_pretrained(model_id, src_lang=src)
-        self._model     = AutoModelForSeq2SeqLM.from_pretrained(model_id)
-        self._model.eval()
-
-    def translate(self, text: str) -> str:
-        inputs  = self._tokenizer(text, return_tensors="pt",
-                                  truncation=True, max_length=256)
-        tgt_id  = self._tokenizer.convert_tokens_to_ids(self._tgt)
-        with self._torch.no_grad():
-            output = self._model.generate(
-                **inputs, forced_bos_token_id=tgt_id, max_length=256
-            )
-        return self._tokenizer.decode(output[0], skip_special_tokens=True)
-
-
-# ── Model download worker ────────────────────────────────────────────────── #
+# ── GGUF model download worker ───────────────────────────────────────────── #
 
 class ModelDownloadWorker(QThread):
-    """
-    Downloads one GGUF file from HuggingFace with per-chunk progress signals.
-    Writes to a .part temp file and renames on success so the app never sees a
-    half-written file as "downloaded".
-    """
-    progress = Signal(int, int)   # downloaded_bytes, total_bytes
-    finished = Signal(str)        # absolute local path on success
+    """Downloads a GGUF file from HuggingFace with streaming progress."""
+    progress = Signal(int, int)   # downloaded_mb, total_mb
+    finished = Signal(str)        # path to completed file
     error    = Signal(str)
 
-    def __init__(self, repo: str, filename: str, dest_dir: str):
+    def __init__(self, url: str, dest_path: str):
         super().__init__()
-        self._repo     = repo
-        self._filename = filename
-        self._dest_dir = Path(dest_dir)
-        self._stopped  = False
+        self._url     = url
+        self._dest    = dest_path
+        self._stopped = False
 
     def stop(self):
         self._stopped = True
 
     def run(self):
         import requests
-        url  = f"https://huggingface.co/{self._repo}/resolve/main/{self._filename}"
-        dest = self._dest_dir / self._filename
-        tmp  = self._dest_dir / (self._filename + ".part")
-        self._dest_dir.mkdir(parents=True, exist_ok=True)
-
         try:
-            with requests.get(url, stream=True, timeout=30,
-                              headers={"User-Agent": "comic-translator/1.0"}) as r:
-                if r.status_code == 404:
-                    self.error.emit(
-                        f"404 — file not found on HuggingFace.\n"
-                        f"Repo: {self._repo}\n"
-                        f"Expected file: {self._filename}\n\n"
-                        f"Visit the repo on HuggingFace, download the file manually,\n"
-                        f"then use the Browse button in settings."
-                    )
-                    return
-                r.raise_for_status()
-                total      = int(r.headers.get("content-length", 0))
-                downloaded = 0
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):   # 1 MB chunks
-                        if self._stopped:
-                            tmp.unlink(missing_ok=True)
-                            return
+            print(f"[ModelDownloadWorker] GET {self._url}")
+            resp = requests.get(self._url, stream=True, timeout=60)
+            resp.raise_for_status()
+            total_b = int(resp.headers.get("content-length", 0))
+            done_b  = 0
+            Path(self._dest).parent.mkdir(parents=True, exist_ok=True)
+            with open(self._dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if self._stopped:
+                        print("[ModelDownloadWorker] Cancelled")
+                        try:
+                            Path(self._dest).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                        return
+                    if chunk:
                         f.write(chunk)
-                        downloaded += len(chunk)
-                        self.progress.emit(downloaded // (1024 * 1024), total // (1024 * 1024))
-            tmp.rename(dest)
-            self.finished.emit(str(dest))
-        except Exception as exc:
-            if tmp.exists():
-                tmp.unlink(missing_ok=True)
-            self.error.emit(str(exc))
+                        done_b += len(chunk)
+                        self.progress.emit(
+                            done_b  // (1024 * 1024),
+                            total_b // (1024 * 1024),
+                        )
+            print(f"[ModelDownloadWorker] Complete: {self._dest}")
+            self.finished.emit(self._dest)
+        except Exception as e:
+            print(f"[ModelDownloadWorker] Error: {e}")
+            try:
+                Path(self._dest).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self.error.emit(str(e))
 
 
 # ── Worker thread ───────────────────────────────────────────────────────── #
@@ -626,14 +432,17 @@ class TranslationWorker(QThread):
     """
     Signals emitted during processing:
       progress(count, message) — how many files done so far + a status string
+      step(message) — current sub-step within the active image
       image_done(path, pil_image) — a finished translated image
       finished() — all files processed (or stopped)
       error(message) — a non-fatal error on one file, or a fatal setup error
     """
-    progress   = Signal(int, str)
-    image_done = Signal(str, object)   # str path, PIL Image
-    finished   = Signal()
-    error      = Signal(str)
+    progress    = Signal(int, str)
+    step        = Signal(str)
+    image_done  = Signal(str, object)   # str path, PIL Image
+    finished    = Signal()
+    error       = Signal(str)
+    fatal_error = Signal(str)           # setup failure — shown as a popup
 
     def __init__(self, files, settings):
         super().__init__()
@@ -687,9 +496,13 @@ class TranslationWorker(QThread):
 
         # --- Load translator ---
         self.progress.emit(0, "Setting up translator…")
-        translator = self._build_translator(service, source_lang, target_lang)
-        if translator is None:
-            return  # error already emitted
+        try:
+            translator = self._build_translator(service, source_lang, target_lang)
+        except Exception as e:
+            print(f"[TranslationWorker] Translator init failed: {e}")
+            traceback.print_exc()
+            self.fatal_error.emit(str(e))
+            return
 
         pipeline = ComicTranslationPipeline(
             source_lang=source_lang,
@@ -706,19 +519,25 @@ class TranslationWorker(QThread):
                 break
 
             name = Path(file_path).name
-            self.progress.emit(i, f"Translating {name}  ({i + 1} / {len(self.files)})")
+            self.progress.emit(i, f"Page {i + 1} of {len(self.files)}  —  {name}")
+            self.step.emit("")
 
             forced = manual_zones.get(file_path, [])
+            print(f"[TranslationWorker] Processing {name}  forced_zones={len(forced)}")
             try:
                 result_img, base_img, regions = pipeline.process_image(
-                    file_path, forced_bboxes=forced or None
+                    file_path,
+                    forced_bboxes=forced or None,
+                    progress_cb=lambda s: self.step.emit(s),
                 )
+                print(f"[TranslationWorker] Done {name}  regions={len(regions)}")
                 self.image_done.emit(file_path, {
                     'image':   result_img,
                     'base':    base_img,
                     'regions': regions,
                 })
             except Exception as e:
+                print(f"[TranslationWorker] Error on {name}: {e}")
                 self.error.emit(f"Skipped {name}: {e}")
                 traceback.print_exc()
 
@@ -727,84 +546,38 @@ class TranslationWorker(QThread):
     # ------------------------------------------------------------------ #
 
     def _build_translator(self, service, source_lang, target_lang):
-        """
-        Instantiate the right translator and wrap it in _ThrottledTranslator
-        for services that have rate limits (DeepL, MyMemory).
+        """Instantiate and return the right translator; raises on any failure."""
+        from deep_translator import GoogleTranslator
 
-        Delay values are chosen to stay well inside free-tier limits:
-          Google:   no delay needed (generous limits, reliable)
-          MyMemory: 0.5 s — 5,000 word/day free tier; bursts cause silent failures
-          DeepL:    1.0 s — strict per-second rate limit on free endpoints;
-                    also applies a 20 s timeout so a hung request can't stall
-                    the worker (DeepL sometimes hangs instead of returning 429)
-        """
-        from deep_translator import GoogleTranslator, MyMemoryTranslator, DeeplTranslator
+        print(f"[TranslationWorker] Building translator: service={service!r} "
+              f"src={source_lang!r} tgt={target_lang!r}")
 
-        try:
-            if service == "Google Translate":
-                t = GoogleTranslator(
-                    source="auto",
-                    target=GOOGLE_TARGET_CODES.get(target_lang, target_lang),
-                )
-                return t   # Google is fast and reliable — no throttling needed
+        if service == "Google Translate":
+            t = GoogleTranslator(
+                source="auto",
+                target=GOOGLE_TARGET_CODES.get(target_lang, target_lang),
+            )
+            print("[TranslationWorker] Google Translate ready")
+            return t
 
-            elif service == "MyMemory":
-                src_code = MYMEMORY_CODES.get(source_lang, source_lang)
-                tgt_code = MYMEMORY_CODES.get(target_lang, target_lang)
-                t = MyMemoryTranslator(source=src_code, target=tgt_code)
-                return _ThrottledTranslator(t, delay=0.5, timeout=15.0)
+        elif service == "OPUS-MT (Offline)":
+            self.progress.emit(
+                0,
+                f"Loading OPUS-MT {source_lang}→{target_lang} model "
+                f"— first run downloads ~350 MB to HuggingFace cache, please wait…"
+            )
+            print(f"[TranslationWorker] Loading OPUS-MT {source_lang}→{target_lang}")
+            t = OpusMTTranslator(source_lang, target_lang)
+            print("[TranslationWorker] OPUS-MT ready")
+            return t
 
-            elif service == "DeepL (API Key)":
-                api_key = self.settings.get("deepl_key", "").strip()
-                if not api_key:
-                    self.error.emit("DeepL requires an API key. Enter it in the settings panel.")
-                    return None
-                t = DeeplTranslator(
-                    api_key=api_key,
-                    source="auto",
-                    target=target_lang.upper(),
-                    use_free_api=True,
-                )
-                return _ThrottledTranslator(t, delay=1.0, timeout=20.0)
+        elif service == "Local LLM (GGUF)":
+            model_path = self.settings.get("gguf_path", "").strip()
+            gpu_layers = int(self.settings.get("gguf_gpu_layers", 0))
+            print(f"[TranslationWorker] Loading GGUF: path={model_path!r} gpu_layers={gpu_layers}")
+            self.progress.emit(0, "Loading GGUF model — this may take a moment…")
+            t = LocalLLMTranslator(model_path, source_lang, target_lang, n_gpu_layers=gpu_layers)
+            print("[TranslationWorker] Local LLM ready")
+            return t
 
-            elif service in _EXT_BACKENDS:
-                cfg     = _EXT_BACKENDS[service]
-                to_code = cfg["targets"].get(target_lang, "en")
-                t = ExternalTranslator(cfg["backend"], to_code)
-                # 0.5 s between calls — scraping too fast risks a temporary block
-                return _ThrottledTranslator(t, delay=0.5, timeout=20.0)
-
-            elif service == "OPUS-MT (Offline)":
-                self.progress.emit(
-                    0,
-                    f"Loading OPUS-MT {source_lang}→{target_lang} model "
-                    f"— first run downloads ~350 MB to HuggingFace cache, please wait…"
-                )
-                return OpusMTTranslator(source_lang, target_lang)
-
-            elif service == "Local LLM (GGUF)":
-                model_path = self.settings.get("gguf_path", "").strip()
-                if not model_path:
-                    self.error.emit(
-                        "Local LLM requires a GGUF model file. "
-                        "Download any .gguf (Qwen3, Qwen2.5, Sakura…) and enter its path in settings."
-                    )
-                    return None
-                n_gpu = int(self.settings.get("gguf_gpu_layers", 0))
-                self.progress.emit(0, f"Loading local model from {model_path}…")
-                return LocalLLMTranslator(model_path, source_lang, target_lang,
-                                          n_gpu_layers=n_gpu)
-
-            elif service == "NLLB (Offline)":
-                self.progress.emit(
-                    0,
-                    "Loading NLLB-200 model — first run downloads ~2.4 GB to HuggingFace cache, please wait…"
-                )
-                return NLLBTranslator(source_lang, target_lang)
-
-        except Exception as e:
-            self.error.emit(f"Could not initialise translator: {e}")
-            return None
-
-        self.error.emit(f"Unknown service: {service}")
-        return None
+        raise ValueError(f"Unknown service: {service!r}")
