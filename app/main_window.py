@@ -6,7 +6,7 @@ main_window.py — The main application window built with PySide6.
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QListWidget, QLabel, QPushButton,
     QComboBox, QProgressBar, QFileDialog, QTabWidget,
     QScrollArea, QStatusBar, QGroupBox, QMessageBox,
@@ -1132,14 +1132,76 @@ class MainWindow(QMainWindow):
         g.addWidget(self.svc_combo)
 
         # GGUF / Local LLM settings — only shown when "Local LLM (GGUF)" is selected
-        self.gguf_hint = QLabel(
-            "Requires <b>llama-cpp-python</b>.  "
-            "CPU: <code>pip install llama-cpp-python</code><br>"
-            "GPU: add <code>--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121</code>"
+
+        # Warning box
+        self.gguf_warning = QFrame()
+        self.gguf_warning.setStyleSheet(
+            "QFrame { background:#3a2500; border:1px solid #a05800; border-radius:4px; }"
         )
-        self.gguf_hint.setWordWrap(True)
-        self.gguf_hint.setTextFormat(Qt.RichText)
-        self.gguf_hint.setStyleSheet("color: #aaa; font-size: 10px;")
+        _wl = QVBoxLayout(self.gguf_warning)
+        _wl.setContentsMargins(8, 6, 8, 6)
+        _wl.setSpacing(0)
+        _warn_lbl = QLabel(
+            "<b>⚠  Local LLM is slow and CPU-intensive</b><br>"
+            "Expect 20–60 sec per page on CPU only. "
+            "A CUDA-capable NVIDIA GPU speeds this up significantly."
+        )
+        _warn_lbl.setWordWrap(True)
+        _warn_lbl.setTextFormat(Qt.RichText)
+        _warn_lbl.setStyleSheet("color:#ffcc44; font-size:11px; background:transparent; border:none;")
+        _wl.addWidget(_warn_lbl)
+
+        # Install status row
+        self.gguf_status_row = QWidget()
+        _sr = QHBoxLayout(self.gguf_status_row)
+        _sr.setContentsMargins(0, 0, 0, 0)
+        self.gguf_status_lbl = QLabel()
+        self.gguf_status_lbl.setStyleSheet("font-size:11px;")
+        _sr.addWidget(self.gguf_status_lbl)
+        _sr.addStretch()
+        _recheck_btn = QPushButton("Re-check")
+        _recheck_btn.setFixedHeight(22)
+        _recheck_btn.setStyleSheet("font-size:10px; padding:0 6px;")
+        _recheck_btn.clicked.connect(self._refresh_llama_status)
+        _sr.addWidget(_recheck_btn)
+
+        # Install commands (only visible when not installed)
+        self.gguf_install_widget = QWidget()
+        _il = QVBoxLayout(self.gguf_install_widget)
+        _il.setContentsMargins(0, 0, 0, 0)
+        _il.setSpacing(3)
+
+        def _cmd_row(label, cmd):
+            row = QWidget()
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(4)
+            lbl = QLabel(label)
+            lbl.setStyleSheet("font-size:10px; color:#aaa;")
+            lbl.setFixedWidth(60)
+            edit = QLineEdit(cmd)
+            edit.setReadOnly(True)
+            edit.setStyleSheet("font-size:10px; font-family:monospace; background:#1a1a1a; color:#ccc;")
+            btn = QPushButton("Copy")
+            btn.setFixedWidth(42)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet("font-size:10px; padding:0;")
+            btn.clicked.connect(lambda _, t=cmd: QApplication.clipboard().setText(t))
+            rl.addWidget(lbl); rl.addWidget(edit); rl.addWidget(btn)
+            return row
+
+        _il.addWidget(QLabel("<small>Install <b>llama-cpp-python</b> in your terminal:</small>"))
+        _il.addWidget(_cmd_row("CPU only:", "pip install llama-cpp-python"))
+        _il.addWidget(_cmd_row("NVIDIA GPU:", "pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121"))
+        _note = QLabel(
+            "<small><i>Having install errors? Try the community CPU wheel:<br>"
+            "pip install llama-cpp-python --extra-index-url "
+            "https://github.com/jllllll/llama-cpp-python-cuBLAS-wheels/releases/expanded_assets/v0.2.88</i></small>"
+        )
+        _note.setWordWrap(True)
+        _note.setTextFormat(Qt.RichText)
+        _note.setStyleSheet("color:#888; font-size:10px;")
+        _il.addWidget(_note)
 
         self.gguf_manage_btn = QPushButton("Manage Models…")
         self.gguf_manage_btn.setStyleSheet(
@@ -1178,7 +1240,8 @@ class MainWindow(QMainWindow):
         self.gguf_gpu_spin.setValue(0)
         self.gguf_gpu_spin.setToolTip("Number of model layers to offload to GPU. 999 = fully on GPU.")
 
-        for w in (self.gguf_hint, self.gguf_manage_btn,
+        for w in (self.gguf_warning, self.gguf_status_row, self.gguf_install_widget,
+                  self.gguf_manage_btn,
                   self.gguf_models_label, self._gguf_models_row_widget,
                   self.gguf_file_label, self._gguf_file_row_widget,
                   self.gguf_gpu_label, self.gguf_gpu_spin):
@@ -1346,11 +1409,30 @@ class MainWindow(QMainWindow):
 
     def _on_service_changed(self, text):
         show_gguf = (text == "Local LLM (GGUF)")
-        for w in (self.gguf_hint, self.gguf_manage_btn,
+        for w in (self.gguf_warning, self.gguf_status_row, self.gguf_install_widget,
+                  self.gguf_manage_btn,
                   self.gguf_models_label, self._gguf_models_row_widget,
                   self.gguf_file_label, self._gguf_file_row_widget,
                   self.gguf_gpu_label, self.gguf_gpu_spin):
             w.setVisible(show_gguf)
+        if show_gguf:
+            self._refresh_llama_status()
+
+    def _refresh_llama_status(self):
+        import importlib.util
+        installed = importlib.util.find_spec("llama_cpp") is not None
+        if installed:
+            self.gguf_status_lbl.setText(
+                "<span style='color:#5a9e5a;'>&#10003;  llama-cpp-python is installed</span>"
+            )
+            self.gguf_status_lbl.setTextFormat(Qt.RichText)
+            self.gguf_install_widget.setVisible(False)
+        else:
+            self.gguf_status_lbl.setText(
+                "<span style='color:#cc4444;'>&#10007;  llama-cpp-python not found</span>"
+            )
+            self.gguf_status_lbl.setTextFormat(Qt.RichText)
+            self.gguf_install_widget.setVisible(True)
 
     def _open_model_manager(self):
         models_dir = self.gguf_models_edit.text().strip()
