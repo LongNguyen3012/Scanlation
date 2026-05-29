@@ -25,6 +25,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 SOURCE_LANGUAGES = {
+    "Auto-detect":                 "auto",
     "Japanese":                    "ja",
     "Japanese (Manga OCR)":        "ja_manga",
     "Korean":                      "ko",

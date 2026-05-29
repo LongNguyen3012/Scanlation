@@ -485,13 +485,17 @@ class TranslationWorker(QThread):
             )
             reader = MangaOCRWrapper()
         else:
-            self.progress.emit(0, "Loading OCR model — first run may download ~200 MB, please wait…")
-            ocr_langs = EASYOCR_LANG_MAP.get(source_lang, ["en"])
             try:
                 import torch
                 use_gpu = torch.cuda.is_available()
             except ImportError:
                 use_gpu = False
+            if source_lang == "auto":
+                self.progress.emit(0, "Loading multi-language OCR model — first run may download ~400 MB, please wait…")
+                ocr_langs = ["ja", "ch_sim", "ko", "en"]
+            else:
+                self.progress.emit(0, "Loading OCR model — first run may download ~200 MB, please wait…")
+                ocr_langs = EASYOCR_LANG_MAP.get(source_lang, ["en"])
             reader = easyocr.Reader(ocr_langs, gpu=use_gpu)
 
         # --- Load translator ---
@@ -561,13 +565,15 @@ class TranslationWorker(QThread):
             return t
 
         elif service == "OPUS-MT (Offline)":
+            # OPUS-MT needs an explicit source language; "auto" defaults to Japanese
+            opus_src = "ja" if source_lang == "auto" else source_lang
             self.progress.emit(
                 0,
-                f"Loading OPUS-MT {source_lang}→{target_lang} model "
+                f"Loading OPUS-MT {opus_src}→{target_lang} model "
                 f"— first run downloads ~350 MB to HuggingFace cache, please wait…"
             )
-            print(f"[TranslationWorker] Loading OPUS-MT {source_lang}→{target_lang}")
-            t = OpusMTTranslator(source_lang, target_lang)
+            print(f"[TranslationWorker] Loading OPUS-MT {opus_src}→{target_lang}")
+            t = OpusMTTranslator(opus_src, target_lang)
             print("[TranslationWorker] OPUS-MT ready")
             return t
 

@@ -5,7 +5,7 @@ APPDATA_DIR = Path.home() / "AppData" / "Roaming" / "ComicTranslator"
 _FILE       = APPDATA_DIR / "settings.json"
 
 DEFAULTS: dict = {
-    "source_lang":     "Japanese",
+    "source_lang":     "Auto-detect",
     "target_lang":     "English",
     "service":         "Google Translate",
     "models_dir":      str(APPDATA_DIR / "models"),

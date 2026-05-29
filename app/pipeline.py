@@ -1,9 +1,10 @@
 """pipeline.py — Load → OCR → translate → inpaint → redraw."""
 
+import math
 import os
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 class ComicTranslationPipeline:
@@ -26,31 +27,15 @@ class ComicTranslationPipeline:
                 progress_cb(msg)
 
         pil_orig = Image.open(str(image_path)).convert("RGB")
+        # Fix EXIF rotation — phone/camera images are often stored sideways
+        pil_orig = ImageOps.exif_transpose(pil_orig)
         img_np = np.array(pil_orig)
 
+        # For "auto", _cjk is initially unknown; the fallback will detect it from results
         _cjk = self.source_lang in {"ch_sim", "ch_tra", "ja", "ja_manga", "ko"}
 
         _step("Running OCR…")
-        # Lower CRAFT thresholds for CJK — stylized fonts score lower by default
-        cjk_kwargs = dict(text_threshold=0.6, low_text=0.35) if _cjk else {}
-        results = self.ocr_reader.readtext(img_np, detail=1, paragraph=False,
-                                           **cjk_kwargs)
-
-        # Filter 1: confidence
-        min_conf = 0.1 if _cjk else 0.3
-        results = [r for r in results if r[2] > min_conf]
-
-        # Filter 2: skip boxes covering >12% of image (panel borders / artwork)
-        img_h, img_w = img_np.shape[:2]
-        max_box_area = img_h * img_w * 0.12
-        results = [
-            r for r in results
-            if (max(p[0] for p in r[0]) - min(p[0] for p in r[0])) *
-               (max(p[1] for p in r[0]) - min(p[1] for p in r[0])) < max_box_area
-        ]
-
-        # Filter 3: must contain at least one alphanumeric character
-        results = [r for r in results if any(c.isalnum() for c in r[1])]
+        results = self._ocr_with_fallback(img_np, _cjk, _step)
 
         # User-marked zones — OCR each crop and append, bypassing filters
         if forced_bboxes:
@@ -98,6 +83,72 @@ class ComicTranslationPipeline:
         return img_pil, base_pil, regions
 
     # ------------------------------------------------------------------ #
+    # OCR with adaptive fallback                                           #
+    # ------------------------------------------------------------------ #
+
+    def _ocr_with_fallback(self, img_np, _cjk, _step):
+        """Run OCR with strict settings; if nothing found, retry with rotation detection."""
+        img_h, img_w = img_np.shape[:2]
+
+        # --- First pass: fast, tuned per language ---
+        # "auto" uses neutral thresholds since we don't know the script yet
+        if self.source_lang == "auto":
+            kwargs   = dict(text_threshold=0.5, low_text=0.3)
+            min_conf = 0.15
+        elif _cjk:
+            kwargs   = dict(text_threshold=0.6, low_text=0.35)
+            min_conf = 0.1
+        else:
+            kwargs   = {}
+            min_conf = 0.3
+
+        results = self.ocr_reader.readtext(img_np, detail=1, paragraph=False, **kwargs)
+
+        max_box_area = img_h * img_w * 0.12
+        results = self._filter(results, min_conf, max_box_area, alphanumeric=True)
+
+        if results:
+            return results
+
+        # --- Second pass: relaxed confidence, allow larger boxes ---
+        _step("No text found — retrying with relaxed settings…")
+        results = self.ocr_reader.readtext(
+            img_np, detail=1, paragraph=False,
+            text_threshold=0.4, low_text=0.3,
+        )
+        results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5,
+                               alphanumeric=False)
+
+        if results:
+            return results
+
+        # --- Third pass: try rotating the image (sideways photos, vertical signs) ---
+        _step("Retrying with rotation detection…")
+        try:
+            results = self.ocr_reader.readtext(
+                img_np, detail=1, paragraph=False,
+                text_threshold=0.4, low_text=0.3,
+                rotation_info=[90, 180, 270],
+            )
+        except TypeError:
+            # Older EasyOCR without rotation_info — skip this pass
+            results = []
+        results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5,
+                               alphanumeric=False)
+        return results
+
+    def _filter(self, results, min_conf, max_box_area, alphanumeric):
+        out = [r for r in results if r[2] > min_conf]
+        out = [
+            r for r in out
+            if (max(p[0] for p in r[0]) - min(p[0] for p in r[0])) *
+               (max(p[1] for p in r[0]) - min(p[1] for p in r[0])) < max_box_area
+        ]
+        if alphanumeric:
+            out = [r for r in out if any(c.isalnum() for c in r[1])]
+        return out
+
+    # ------------------------------------------------------------------ #
     # Translation                                                          #
     # ------------------------------------------------------------------ #
 
@@ -112,7 +163,6 @@ class ComicTranslationPipeline:
     def _has_cjk(self, text):
         return any(low <= c <= high for c in text for low, high in self._CJK_RANGES)
 
-    # Detect when the translator returned source CJK text unchanged
     _LATIN_TARGETS = {"en", "es", "fr", "de", "pt", "ru", "it", "vi", "th"}
 
     def _translate_texts(self, texts):
@@ -150,9 +200,23 @@ class ComicTranslationPipeline:
     # Text rendering                                                       #
     # ------------------------------------------------------------------ #
 
+    def _quad_angle(self, pts):
+        """Rotation angle in degrees of the top edge of a quad (top-left → top-right)."""
+        if len(pts) < 2:
+            return 0.0
+        dx = pts[1][0] - pts[0][0]
+        dy = pts[1][1] - pts[0][1]
+        return math.degrees(math.atan2(dy, dx))
+
     def _render(self, draw, img_pil, text, bbox, font_size=None):
-        """Draw text into bbox; returns font size used. font_size=None auto-fits."""
+        """Draw text into bbox; returns font size used. Handles rotated quads."""
         pts = [(int(p[0]), int(p[1])) for p in bbox]
+        angle = self._quad_angle(pts)
+
+        # For text tilted more than 5° use the rotated tile renderer
+        if abs(angle) > 5:
+            return self._render_rotated(img_pil, text, pts, angle, font_size)
+
         x1 = max(0, min(p[0] for p in pts))
         y1 = max(0, min(p[1] for p in pts))
         x2 = min(img_pil.width,  max(p[0] for p in pts))
@@ -196,9 +260,57 @@ class ComicTranslationPipeline:
             try:
                 text_w = draw.textbbox((0, 0), line, font=font)[2]
             except Exception:
-                text_w = len(line) * 7  # rough fallback
+                text_w = len(line) * 7
             draw.text((x1 + max(0, (box_w - text_w) // 2), cur_y), line, fill=fg, font=font)
             cur_y += line_h
+
+        return actual_size
+
+    def _render_rotated(self, img_pil, text, pts, angle, font_size=None):
+        """Render text on a rotated tile matching the detected text angle."""
+        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+        x1 = max(0, min(xs)); y1 = max(0, min(ys))
+        x2 = min(img_pil.width, max(xs)); y2 = min(img_pil.height, max(ys))
+        box_w = x2 - x1; box_h = y2 - y1
+        if box_w <= 2 or box_h <= 2:
+            return font_size or 10
+
+        region = img_pil.crop((x1, y1, x2, y2))
+        bg = self._dominant_color(region)
+        fg = self._contrast_color(bg)
+
+        # Draw text on a flat (unrotated) RGBA tile
+        tile = Image.new("RGBA", (box_w, box_h), bg + (255,))
+        tile_draw = ImageDraw.Draw(tile)
+
+        if font_size:
+            font  = self._get_font(font_size)
+            lines = self._wrap(text, font, box_w, tile_draw)
+        else:
+            font, lines = self._fit_text(text, box_w, box_h, tile_draw)
+
+        actual_size = font.size if hasattr(font, 'size') else 10
+        line_h = self._line_height(font)
+        total_h = line_h * len(lines)
+        cur_y = max(0, (box_h - total_h) // 2)
+
+        for line in lines:
+            if cur_y + line_h > box_h:
+                break
+            try:
+                text_w = tile_draw.textbbox((0, 0), line, font=font)[2]
+            except Exception:
+                text_w = len(line) * 7
+            tile_draw.text((max(0, (box_w - text_w) // 2), cur_y), line, fill=fg, font=font)
+            cur_y += line_h
+
+        # PIL rotates counter-clockwise; negate angle to match EasyOCR's clockwise convention
+        rotated = tile.rotate(-angle, resample=Image.BICUBIC, expand=True)
+
+        # Paste centred over the original axis-aligned box
+        cx = (x1 + x2) // 2; cy = (y1 + y2) // 2
+        px = cx - rotated.width // 2; py = cy - rotated.height // 2
+        img_pil.paste(rotated, (px, py), rotated)
 
         return actual_size
 
@@ -233,7 +345,7 @@ class ComicTranslationPipeline:
         try:
             return font.size + 3
         except AttributeError:
-            return 13  # PIL default font has no .size
+            return 13
 
     def _get_font(self, size):
         """Load and cache a TrueType font at the given size."""
@@ -287,23 +399,23 @@ class ComicTranslationPipeline:
         """Return a font path that can render target_lang; None falls back to PIL default."""
         CJK_FONTS = {
             "zh-CN": [
-                r"C:\Windows\Fonts\msyh.ttc",    # Microsoft YaHei
-                r"C:\Windows\Fonts\simsun.ttc",  # SimSun
-                r"C:\Windows\Fonts\simhei.ttf",  # SimHei
+                r"C:\Windows\Fonts\msyh.ttc",
+                r"C:\Windows\Fonts\simsun.ttc",
+                r"C:\Windows\Fonts\simhei.ttf",
             ],
             "zh-TW": [
-                r"C:\Windows\Fonts\msjh.ttc",      # Microsoft JhengHei
-                r"C:\Windows\Fonts\mingliu.ttc",   # MingLiU
+                r"C:\Windows\Fonts\msjh.ttc",
+                r"C:\Windows\Fonts\mingliu.ttc",
             ],
             "ja": [
-                r"C:\Windows\Fonts\meiryo.ttc",    # Meiryo
-                r"C:\Windows\Fonts\msgothic.ttc",  # MS Gothic
-                r"C:\Windows\Fonts\msmincho.ttc",  # MS Mincho
+                r"C:\Windows\Fonts\meiryo.ttc",
+                r"C:\Windows\Fonts\msgothic.ttc",
+                r"C:\Windows\Fonts\msmincho.ttc",
             ],
             "ko": [
-                r"C:\Windows\Fonts\malgun.ttf",    # Malgun Gothic
-                r"C:\Windows\Fonts\gulim.ttc",     # Gulim
-                r"C:\Windows\Fonts\batang.ttc",    # Batang
+                r"C:\Windows\Fonts\malgun.ttf",
+                r"C:\Windows\Fonts\gulim.ttc",
+                r"C:\Windows\Fonts\batang.ttc",
             ],
         }
 
