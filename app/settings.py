@@ -8,12 +8,8 @@ DEFAULTS: dict = {
     "source_lang":     "Auto-detect",
     "target_lang":     "English",
     "service":         "Google Translate",
-    "models_dir":      str(APPDATA_DIR / "models"),
-    "gguf_path":       "",
-    "gguf_gpu_layers": 0,
     "output_dir":      "",
 }
-
 
 def load() -> dict:
     if _FILE.exists():
@@ -24,7 +20,6 @@ def load() -> dict:
         except Exception:
             pass
     return dict(DEFAULTS)
-
 
 def save(data: dict) -> None:
     APPDATA_DIR.mkdir(parents=True, exist_ok=True)

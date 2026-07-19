@@ -1,11 +1,8 @@
-"""pipeline.py — Load → OCR → translate → inpaint → redraw."""
-
 import math
 import os
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
-
 
 class ComicTranslationPipeline:
     def __init__(self, source_lang, target_lang, ocr_reader, translator):
@@ -13,32 +10,24 @@ class ComicTranslationPipeline:
         self.target_lang = target_lang
         self.ocr_reader = ocr_reader
         self.translator = translator
-        self._font_cache = {}  # size → ImageFont
+        self._font_cache = {}
         self._font_path = self._find_font(target_lang)
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
-
     def process_image(self, image_path, forced_bboxes=None, progress_cb=None):
-        """Translate all text in one image. Returns (translated PIL, base PIL, regions)."""
         def _step(msg):
             if progress_cb:
                 progress_cb(msg)
 
         pil_orig = Image.open(str(image_path)).convert("RGB")
-        # Fix EXIF rotation — phone/camera images are often stored sideways
         pil_orig = ImageOps.exif_transpose(pil_orig)
         img_np = np.array(pil_orig)
 
-        # For "auto", _cjk is initially unknown; the fallback will detect it from results
         _cjk = self.source_lang in {"ch_sim", "ch_tra", "ja", "ja_manga", "ko"}
 
-        _step("Running OCR…")
-        results = self._ocr_with_fallback(img_np, _cjk, _step)
+        results = []
 
-        # User-marked zones — OCR each crop and append, bypassing filters
         if forced_bboxes:
+            _step("Processing user‑marked zones…")
             for bbox in forced_bboxes:
                 xs = [p[0] for p in bbox]; ys = [p[1] for p in bbox]
                 x1 = max(0, int(min(xs))); y1 = max(0, int(min(ys)))
@@ -54,10 +43,15 @@ class ComicTranslationPipeline:
                             results.append((adj, r[1], r[2]))
                 except Exception:
                     pass
+        else:
+            _step("Running OCR…")
+            results = self._ocr_with_fallback(img_np, _cjk, _step)
 
         if not results:
             _step("No text found — skipping.")
             return pil_orig, pil_orig.copy(), []
+
+        results = self._merge_text_boxes(results)
 
         texts = [r[1] for r in results]
         _step(f"Translating {len(texts)} text region(s)…")
@@ -71,27 +65,181 @@ class ComicTranslationPipeline:
 
         _step("Rendering translation…")
         img_pil = Image.fromarray(cv2.cvtColor(img_inpainted, cv2.COLOR_BGR2RGB))
-        base_pil = img_pil.copy()  # inpainted without text, kept for re-editing
+        base_pil = img_pil.copy()
         draw = ImageDraw.Draw(img_pil)
 
         regions = []
         for result, trans in zip(results, translated):
             if trans:
                 fs = self._render(draw, img_pil, trans, result[0])
-                regions.append({'bbox': result[0], 'text': trans, 'font_size': fs})
+                regions.append({
+                    'bbox': result[0],
+                    'original_text': result[1],
+                    'text': trans,
+                    'font_size': fs
+                })
+            else:
+                regions.append({
+                    'bbox': result[0],
+                    'original_text': result[1],
+                    'text': '',
+                    'font_size': 12
+                })
 
         return img_pil, base_pil, regions
 
-    # ------------------------------------------------------------------ #
-    # OCR with adaptive fallback                                           #
-    # ------------------------------------------------------------------ #
+    def _merge_text_boxes(self, results):
+        if len(results) <= 1:
+            return results
+
+        boxes = []
+        for bbox, text, conf in results:
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            x1, x2 = min(xs), max(xs)
+            y1, y2 = min(ys), max(ys)
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            width = x2 - x1
+            height = y2 - y1
+            boxes.append({
+                'bbox': bbox,
+                'text': text,
+                'conf': conf,
+                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                'cx': cx, 'cy': cy,
+                'width': width, 'height': height,
+                'used': False
+            })
+
+        is_vertical = any(b['height'] > b['width'] * 1.5 for b in boxes)
+
+        if is_vertical:
+            boxes.sort(key=lambda b: b['cx'])
+            columns = []
+            for b in boxes:
+                added = False
+                for col in columns:
+                    # Stricter column grouping: 35% average width
+                    if abs(b['cx'] - col['cx']) < (b['width'] + col['avg_width']) * 0.35:
+                        col['boxes'].append(b)
+                        col['cx'] = (col['cx'] + b['cx']) / 2
+                        col['avg_width'] = (col['avg_width'] + b['width']) / 2
+                        added = True
+                        break
+                if not added:
+                    columns.append({
+                        'cx': b['cx'],
+                        'avg_width': b['width'],
+                        'boxes': [b]
+                    })
+
+            merged = []
+            for col in columns:
+                col['boxes'].sort(key=lambda b: b['y1'])
+                group = []
+                avg_height = sum(b['height'] for b in col['boxes']) / len(col['boxes'])
+                for b in col['boxes']:
+                    if not group:
+                        group.append(b)
+                    else:
+                        last = group[-1]
+                        gap = b['y1'] - last['y2']
+                        # Check vertical overlap of x-ranges
+                        overlap_x = max(0, min(b['x2'], last['x2']) - max(b['x1'], last['x1']))
+                        min_width = min(b['width'], last['width'])
+                        x_overlap_ratio = overlap_x / min_width if min_width > 0 else 0
+                        # Merge only if gap < 1.5*avg_height and horizontal overlap > 30%
+                        if gap < avg_height * 1.5 and x_overlap_ratio > 0.3:
+                            group.append(b)
+                        else:
+                            if len(group) > 1:
+                                merged_text = ' '.join([g['text'] for g in group])
+                                xs = [p for g in group for p in [g['x1'], g['x2']]]
+                                ys = [p for g in group for p in [g['y1'], g['y2']]]
+                                new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
+                                            [max(xs), max(ys)], [min(xs), max(ys)]]
+                                avg_conf = sum(g['conf'] for g in group) / len(group)
+                                merged.append((new_bbox, merged_text, avg_conf))
+                            else:
+                                merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
+                            group = [b]
+                if group:
+                    if len(group) > 1:
+                        merged_text = ' '.join([g['text'] for g in group])
+                        xs = [p for g in group for p in [g['x1'], g['x2']]]
+                        ys = [p for g in group for p in [g['y1'], g['y2']]]
+                        new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
+                                    [max(xs), max(ys)], [min(xs), max(ys)]]
+                        avg_conf = sum(g['conf'] for g in group) / len(group)
+                        merged.append((new_bbox, merged_text, avg_conf))
+                    else:
+                        merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
+            return merged
+
+        else:
+            boxes.sort(key=lambda b: b['cy'])
+            rows = []
+            for b in boxes:
+                added = False
+                for row in rows:
+                    if abs(b['cy'] - row['cy']) < (b['height'] + row['avg_height']) * 0.35:
+                        row['boxes'].append(b)
+                        row['cy'] = (row['cy'] + b['cy']) / 2
+                        row['avg_height'] = (row['avg_height'] + b['height']) / 2
+                        added = True
+                        break
+                if not added:
+                    rows.append({
+                        'cy': b['cy'],
+                        'avg_height': b['height'],
+                        'boxes': [b]
+                    })
+
+            merged = []
+            for row in rows:
+                row['boxes'].sort(key=lambda b: b['x1'])
+                group = []
+                avg_width = sum(b['width'] for b in row['boxes']) / len(row['boxes'])
+                for b in row['boxes']:
+                    if not group:
+                        group.append(b)
+                    else:
+                        last = group[-1]
+                        gap = b['x1'] - last['x2']
+                        overlap_y = max(0, min(b['y2'], last['y2']) - max(b['y1'], last['y1']))
+                        min_height = min(b['height'], last['height'])
+                        y_overlap_ratio = overlap_y / min_height if min_height > 0 else 0
+                        if gap < avg_width * 1.5 and y_overlap_ratio > 0.3:
+                            group.append(b)
+                        else:
+                            if len(group) > 1:
+                                merged_text = ' '.join([g['text'] for g in group])
+                                xs = [p for g in group for p in [g['x1'], g['x2']]]
+                                ys = [p for g in group for p in [g['y1'], g['y2']]]
+                                new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
+                                            [max(xs), max(ys)], [min(xs), max(ys)]]
+                                avg_conf = sum(g['conf'] for g in group) / len(group)
+                                merged.append((new_bbox, merged_text, avg_conf))
+                            else:
+                                merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
+                            group = [b]
+                if group:
+                    if len(group) > 1:
+                        merged_text = ' '.join([g['text'] for g in group])
+                        xs = [p for g in group for p in [g['x1'], g['x2']]]
+                        ys = [p for g in group for p in [g['y1'], g['y2']]]
+                        new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
+                                    [max(xs), max(ys)], [min(xs), max(ys)]]
+                        avg_conf = sum(g['conf'] for g in group) / len(group)
+                        merged.append((new_bbox, merged_text, avg_conf))
+                    else:
+                        merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
+            return merged
 
     def _ocr_with_fallback(self, img_np, _cjk, _step):
-        """Run OCR with strict settings; if nothing found, retry with rotation detection."""
         img_h, img_w = img_np.shape[:2]
 
-        # --- First pass: fast, tuned per language ---
-        # "auto" uses neutral thresholds since we don't know the script yet
         if self.source_lang == "auto":
             kwargs   = dict(text_threshold=0.5, low_text=0.3)
             min_conf = 0.15
@@ -110,7 +258,6 @@ class ComicTranslationPipeline:
         if results:
             return results
 
-        # --- Second pass: relaxed confidence, allow larger boxes ---
         _step("No text found — retrying with relaxed settings…")
         results = self.ocr_reader.readtext(
             img_np, detail=1, paragraph=False,
@@ -122,7 +269,6 @@ class ComicTranslationPipeline:
         if results:
             return results
 
-        # --- Third pass: try rotating the image (sideways photos, vertical signs) ---
         _step("Retrying with rotation detection…")
         try:
             results = self.ocr_reader.readtext(
@@ -131,7 +277,6 @@ class ComicTranslationPipeline:
                 rotation_info=[90, 180, 270],
             )
         except TypeError:
-            # Older EasyOCR without rotation_info — skip this pass
             results = []
         results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5,
                                alphanumeric=False)
@@ -148,16 +293,12 @@ class ComicTranslationPipeline:
             out = [r for r in out if any(c.isalnum() for c in r[1])]
         return out
 
-    # ------------------------------------------------------------------ #
-    # Translation                                                          #
-    # ------------------------------------------------------------------ #
-
     _CJK_RANGES = [
-        ('一', '鿿'),   # CJK Unified Ideographs
-        ('぀', 'ゟ'),   # Hiragana
-        ('゠', 'ヿ'),   # Katakana
-        ('가', '힯'),   # Hangul
-        ('㐀', '䶿'),   # CJK Extension A
+        ('一', '鿿'),
+        ('぀', 'ゟ'),
+        ('゠', 'ヿ'),
+        ('가', '힯'),
+        ('㐀', '䶿'),
     ]
 
     def _has_cjk(self, text):
@@ -166,7 +307,6 @@ class ComicTranslationPipeline:
     _LATIN_TARGETS = {"en", "es", "fr", "de", "pt", "ru", "it", "vi", "th"}
 
     def _translate_texts(self, texts):
-        """Translate a list of strings; returns '' on failure or untranslated CJK."""
         out = []
         for text in texts:
             text = text.strip()
@@ -184,36 +324,36 @@ class ComicTranslationPipeline:
                 out.append("")
         return out
 
-    # ------------------------------------------------------------------ #
-    # Mask building                                                        #
-    # ------------------------------------------------------------------ #
-
     def _build_mask(self, shape, results):
-        """White-fill each detected text region on a black mask."""
         mask = np.zeros(shape, dtype=np.uint8)
         for r in results:
             pts = np.array([[int(p[0]), int(p[1])] for p in r[0]], dtype=np.int32)
             cv2.fillPoly(mask, [pts], 255)
         return mask
 
-    # ------------------------------------------------------------------ #
-    # Text rendering                                                       #
-    # ------------------------------------------------------------------ #
-
     def _quad_angle(self, pts):
-        """Rotation angle in degrees of the top edge of a quad (top-left → top-right)."""
         if len(pts) < 2:
             return 0.0
         dx = pts[1][0] - pts[0][0]
         dy = pts[1][1] - pts[0][1]
         return math.degrees(math.atan2(dy, dx))
 
+    def _is_vertical_box(self, x1, y1, x2, y2):
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0 or height <= 0:
+            return False
+        cjk_sources = {"ja", "ja_manga", "ko", "ch_sim", "ch_tra"}
+        latin_targets = {"en", "es", "fr", "de", "pt", "ru", "it", "vi", "th"}
+        if self.source_lang in cjk_sources and self.target_lang in latin_targets:
+            if height > 1.5 * width:
+                return True
+        return False
+
     def _render(self, draw, img_pil, text, bbox, font_size=None):
-        """Draw text into bbox; returns font size used. Handles rotated quads."""
         pts = [(int(p[0]), int(p[1])) for p in bbox]
         angle = self._quad_angle(pts)
 
-        # For text tilted more than 5° use the rotated tile renderer
         if abs(angle) > 5:
             return self._render_rotated(img_pil, text, pts, angle, font_size)
 
@@ -227,30 +367,48 @@ class ComicTranslationPipeline:
         if box_w <= 2 or box_h <= 2:
             return font_size or 10
 
-        # CJK columns can be very narrow — expand to a minimum usable width
+        is_vertical = self._is_vertical_box(x1, y1, x2, y2)
+        original_w = box_w
+        original_h = box_h
+
         MIN_RENDER_W = 60
-        if box_w < MIN_RENDER_W:
+        if not is_vertical and box_w < MIN_RENDER_W:
             cx = (x1 + x2) // 2
             x1 = max(0, cx - MIN_RENDER_W // 2)
             x2 = min(img_pil.width, x1 + MIN_RENDER_W)
             box_w = x2 - x1
+
+        if is_vertical:
+            max_expand = 1.5
+            new_w = min(img_pil.width, int(box_w * max_expand))
+            if new_w > box_w:
+                cx = (x1 + x2) // 2
+                x1 = max(0, cx - new_w // 2)
+                x2 = min(img_pil.width, x1 + new_w)
+                box_w = x2 - x1
 
         region = img_pil.crop((x1, y1, x2, y2))
         bg = self._dominant_color(region)
         fg = self._contrast_color(bg)
         draw.rectangle([x1, y1, x2, y2], fill=bg)
 
+        min_size = 5 if is_vertical else 7
+
         if font_size:
-            font  = self._get_font(font_size)
+            font = self._get_font(font_size)
             lines = self._wrap(text, font, box_w, draw)
         else:
-            font, lines = self._fit_text(text, box_w, box_h, draw)
+            font, lines = self._fit_text(text, box_w, box_h, draw, min_size=min_size)
 
         if not lines:
             return font_size or 10
 
         actual_size = font.size if hasattr(font, 'size') else 10
-        line_h = self._line_height(font)
+        if is_vertical:
+            line_h = int(actual_size * 1.4)
+        else:
+            line_h = self._line_height(font)
+
         total_h = line_h * len(lines)
         cur_y = y1 + max(0, (box_h - total_h) // 2)
 
@@ -267,7 +425,6 @@ class ComicTranslationPipeline:
         return actual_size
 
     def _render_rotated(self, img_pil, text, pts, angle, font_size=None):
-        """Render text on a rotated tile matching the detected text angle."""
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
         x1 = max(0, min(xs)); y1 = max(0, min(ys))
         x2 = min(img_pil.width, max(xs)); y2 = min(img_pil.height, max(ys))
@@ -279,15 +436,14 @@ class ComicTranslationPipeline:
         bg = self._dominant_color(region)
         fg = self._contrast_color(bg)
 
-        # Draw text on a flat (unrotated) RGBA tile
         tile = Image.new("RGBA", (box_w, box_h), bg + (255,))
         tile_draw = ImageDraw.Draw(tile)
 
         if font_size:
-            font  = self._get_font(font_size)
+            font = self._get_font(font_size)
             lines = self._wrap(text, font, box_w, tile_draw)
         else:
-            font, lines = self._fit_text(text, box_w, box_h, tile_draw)
+            font, lines = self._fit_text(text, box_w, box_h, tile_draw, min_size=7)
 
         actual_size = font.size if hasattr(font, 'size') else 10
         line_h = self._line_height(font)
@@ -304,10 +460,8 @@ class ComicTranslationPipeline:
             tile_draw.text((max(0, (box_w - text_w) // 2), cur_y), line, fill=fg, font=font)
             cur_y += line_h
 
-        # PIL rotates counter-clockwise; negate angle to match EasyOCR's clockwise convention
         rotated = tile.rotate(-angle, resample=Image.BICUBIC, expand=True)
 
-        # Paste centred over the original axis-aligned box
         cx = (x1 + x2) // 2; cy = (y1 + y2) // 2
         px = cx - rotated.width // 2; py = cy - rotated.height // 2
         img_pil.paste(rotated, (px, py), rotated)
@@ -315,7 +469,6 @@ class ComicTranslationPipeline:
         return actual_size
 
     def render_from_regions(self, base_img, regions):
-        """Re-render base_img (inpainted) using an updated regions list."""
         img = base_img.copy()
         draw = ImageDraw.Draw(img)
         for r in regions:
@@ -323,23 +476,13 @@ class ComicTranslationPipeline:
                 self._render(draw, img, r['text'], r['bbox'], font_size=r.get('font_size'))
         return img
 
-    # ------------------------------------------------------------------ #
-    # Colour helpers                                                       #
-    # ------------------------------------------------------------------ #
-
     def _dominant_color(self, region):
-        """Return average (R, G, B) of a PIL image crop."""
         a = np.array(region.convert("RGB"))
         return (int(a[:, :, 0].mean()), int(a[:, :, 1].mean()), int(a[:, :, 2].mean()))
 
     def _contrast_color(self, bg):
-        """Return black or white for best contrast against bg."""
         lum = 0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]
         return (0, 0, 0) if lum > 128 else (255, 255, 255)
-
-    # ------------------------------------------------------------------ #
-    # Font / text sizing helpers                                           #
-    # ------------------------------------------------------------------ #
 
     def _line_height(self, font):
         try:
@@ -348,7 +491,6 @@ class ComicTranslationPipeline:
             return 13
 
     def _get_font(self, size):
-        """Load and cache a TrueType font at the given size."""
         if size not in self._font_cache:
             try:
                 self._font_cache[size] = (
@@ -359,19 +501,17 @@ class ComicTranslationPipeline:
                 self._font_cache[size] = ImageFont.load_default()
         return self._font_cache[size]
 
-    def _fit_text(self, text, max_w, max_h, draw):
-        """Shrink font from 18→7pt until text fits; truncates as last resort."""
-        for size in range(18, 6, -1):
+    def _fit_text(self, text, max_w, max_h, draw, min_size=7):
+        for size in range(18, min_size - 1, -1):
             font = self._get_font(size)
             lines = self._wrap(text, font, max_w, draw)
             if self._line_height(font) * len(lines) <= max_h:
                 return font, lines
-        font = self._get_font(7)
+        font = self._get_font(min_size)
         short = text if len(text) <= 20 else text[:17] + "..."
         return font, [short]
 
     def _wrap(self, text, font, max_w, draw):
-        """Word-wrap text to fit max_w pixels; returns list of lines."""
         words = text.split()
         if not words:
             return [""]
@@ -391,12 +531,7 @@ class ComicTranslationPipeline:
             lines.append(" ".join(current))
         return lines or [""]
 
-    # ------------------------------------------------------------------ #
-    # Font discovery                                                       #
-    # ------------------------------------------------------------------ #
-
     def _find_font(self, target_lang=None):
-        """Return a font path that can render target_lang; None falls back to PIL default."""
         CJK_FONTS = {
             "zh-CN": [
                 r"C:\Windows\Fonts\msyh.ttc",
