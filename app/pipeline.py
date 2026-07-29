@@ -88,6 +88,16 @@ class ComicTranslationPipeline:
 
         return img_pil, base_pil, regions
 
+    def _get_merge_preset(self):
+        if self.source_lang == "ko":
+            return {'gap_factor': 2.5, 'align_tol': 0.5, 'overlap_req': 0.0}
+        elif self.source_lang in ("ja", "ja_manga"):
+            return {'gap_factor': 2.0, 'align_tol': 0.4, 'overlap_req': 0.3}
+        elif self.source_lang in ("ch_sim", "ch_tra"):
+            return {'gap_factor': 2.0, 'align_tol': 0.5, 'overlap_req': 0.0}
+        else:
+            return {'gap_factor': 2.0, 'align_tol': 0.5, 'overlap_req': 0.0}
+
     def _merge_text_boxes(self, results):
         if len(results) <= 1:
             return results
@@ -98,144 +108,103 @@ class ComicTranslationPipeline:
             ys = [p[1] for p in bbox]
             x1, x2 = min(xs), max(xs)
             y1, y2 = min(ys), max(ys)
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            width = x2 - x1
-            height = y2 - y1
             boxes.append({
                 'bbox': bbox,
                 'text': text,
                 'conf': conf,
                 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'cx': cx, 'cy': cy,
-                'width': width, 'height': height,
-                'used': False
+                'cx': (x1 + x2) / 2,
+                'cy': (y1 + y2) / 2,
+                'width': x2 - x1,
+                'height': y2 - y1
             })
 
-        is_vertical = any(b['height'] > b['width'] * 1.5 for b in boxes)
+        n = len(boxes)
+        parent = list(range(n))
 
-        if is_vertical:
-            boxes.sort(key=lambda b: b['cx'])
-            columns = []
-            for b in boxes:
-                added = False
-                for col in columns:
-                    # Stricter column grouping: 35% average width
-                    if abs(b['cx'] - col['cx']) < (b['width'] + col['avg_width']) * 0.35:
-                        col['boxes'].append(b)
-                        col['cx'] = (col['cx'] + b['cx']) / 2
-                        col['avg_width'] = (col['avg_width'] + b['width']) / 2
-                        added = True
-                        break
-                if not added:
-                    columns.append({
-                        'cx': b['cx'],
-                        'avg_width': b['width'],
-                        'boxes': [b]
-                    })
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
 
-            merged = []
-            for col in columns:
-                col['boxes'].sort(key=lambda b: b['y1'])
-                group = []
-                avg_height = sum(b['height'] for b in col['boxes']) / len(col['boxes'])
-                for b in col['boxes']:
-                    if not group:
-                        group.append(b)
-                    else:
-                        last = group[-1]
-                        gap = b['y1'] - last['y2']
-                        # Check vertical overlap of x-ranges
-                        overlap_x = max(0, min(b['x2'], last['x2']) - max(b['x1'], last['x1']))
-                        min_width = min(b['width'], last['width'])
-                        x_overlap_ratio = overlap_x / min_width if min_width > 0 else 0
-                        # Merge only if gap < 1.5*avg_height and horizontal overlap > 30%
-                        if gap < avg_height * 1.5 and x_overlap_ratio > 0.3:
-                            group.append(b)
-                        else:
-                            if len(group) > 1:
-                                merged_text = ' '.join([g['text'] for g in group])
-                                xs = [p for g in group for p in [g['x1'], g['x2']]]
-                                ys = [p for g in group for p in [g['y1'], g['y2']]]
-                                new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
-                                            [max(xs), max(ys)], [min(xs), max(ys)]]
-                                avg_conf = sum(g['conf'] for g in group) / len(group)
-                                merged.append((new_bbox, merged_text, avg_conf))
-                            else:
-                                merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
-                            group = [b]
-                if group:
-                    if len(group) > 1:
-                        merged_text = ' '.join([g['text'] for g in group])
-                        xs = [p for g in group for p in [g['x1'], g['x2']]]
-                        ys = [p for g in group for p in [g['y1'], g['y2']]]
-                        new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
-                                    [max(xs), max(ys)], [min(xs), max(ys)]]
-                        avg_conf = sum(g['conf'] for g in group) / len(group)
-                        merged.append((new_bbox, merged_text, avg_conf))
-                    else:
-                        merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
-            return merged
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
 
-        else:
-            boxes.sort(key=lambda b: b['cy'])
-            rows = []
-            for b in boxes:
-                added = False
-                for row in rows:
-                    if abs(b['cy'] - row['cy']) < (b['height'] + row['avg_height']) * 0.35:
-                        row['boxes'].append(b)
-                        row['cy'] = (row['cy'] + b['cy']) / 2
-                        row['avg_height'] = (row['avg_height'] + b['height']) / 2
-                        added = True
-                        break
-                if not added:
-                    rows.append({
-                        'cy': b['cy'],
-                        'avg_height': b['height'],
-                        'boxes': [b]
-                    })
+        preset = self._get_merge_preset()
+        gap_factor = preset['gap_factor']
+        align_tol = preset['align_tol']
+        overlap_req = preset['overlap_req']
 
-            merged = []
-            for row in rows:
-                row['boxes'].sort(key=lambda b: b['x1'])
-                group = []
-                avg_width = sum(b['width'] for b in row['boxes']) / len(row['boxes'])
-                for b in row['boxes']:
-                    if not group:
-                        group.append(b)
-                    else:
-                        last = group[-1]
-                        gap = b['x1'] - last['x2']
-                        overlap_y = max(0, min(b['y2'], last['y2']) - max(b['y1'], last['y1']))
-                        min_height = min(b['height'], last['height'])
-                        y_overlap_ratio = overlap_y / min_height if min_height > 0 else 0
-                        if gap < avg_width * 1.5 and y_overlap_ratio > 0.3:
-                            group.append(b)
-                        else:
-                            if len(group) > 1:
-                                merged_text = ' '.join([g['text'] for g in group])
-                                xs = [p for g in group for p in [g['x1'], g['x2']]]
-                                ys = [p for g in group for p in [g['y1'], g['y2']]]
-                                new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
-                                            [max(xs), max(ys)], [min(xs), max(ys)]]
-                                avg_conf = sum(g['conf'] for g in group) / len(group)
-                                merged.append((new_bbox, merged_text, avg_conf))
-                            else:
-                                merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
-                            group = [b]
-                if group:
-                    if len(group) > 1:
-                        merged_text = ' '.join([g['text'] for g in group])
-                        xs = [p for g in group for p in [g['x1'], g['x2']]]
-                        ys = [p for g in group for p in [g['y1'], g['y2']]]
-                        new_bbox = [[min(xs), min(ys)], [max(xs), min(ys)],
-                                    [max(xs), max(ys)], [min(xs), max(ys)]]
-                        avg_conf = sum(g['conf'] for g in group) / len(group)
-                        merged.append((new_bbox, merged_text, avg_conf))
-                    else:
-                        merged.append((group[0]['bbox'], group[0]['text'], group[0]['conf']))
-            return merged
+        def should_connect(i, j):
+            a, b = boxes[i], boxes[j]
+            a_vert = a['height'] > a['width'] * 1.5
+            b_vert = b['height'] > b['width'] * 1.5
+
+            if a_vert != b_vert:
+                return False
+
+            if a_vert:
+                if abs(a['cx'] - b['cx']) > max(a['width'], b['width']) * align_tol:
+                    return False
+                gap = min(a['y2'], b['y2']) - max(a['y1'], b['y1'])
+                if gap < -max(a['height'], b['height']) * 0.5:
+                    return False
+                if abs(a['y1'] - b['y1']) > max(a['height'], b['height']) * gap_factor:
+                    return False
+                if overlap_req > 0:
+                    overlap_x = max(0, min(a['x2'], b['x2']) - max(a['x1'], b['x1']))
+                    min_width = min(a['width'], b['width'])
+                    if min_width > 0 and overlap_x / min_width < overlap_req:
+                        return False
+                return True
+            else:
+                if abs(a['cy'] - b['cy']) > max(a['height'], b['height']) * align_tol:
+                    return False
+                gap = min(a['x2'], b['x2']) - max(a['x1'], b['x1'])
+                if gap < -max(a['width'], b['width']) * 0.5:
+                    return False
+                if abs(a['x1'] - b['x1']) > max(a['width'], b['width']) * gap_factor:
+                    return False
+                if overlap_req > 0:
+                    overlap_y = max(0, min(a['y2'], b['y2']) - max(a['y1'], b['y1']))
+                    min_height = min(a['height'], b['height'])
+                    if min_height > 0 and overlap_y / min_height < overlap_req:
+                        return False
+                return True
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                if should_connect(i, j):
+                    union(i, j)
+
+        groups = {}
+        for i in range(n):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        merged = []
+        for indices in groups.values():
+            if len(indices) == 1:
+                idx = indices[0]
+                merged.append((boxes[idx]['bbox'], boxes[idx]['text'], boxes[idx]['conf']))
+            else:
+                group_boxes = [boxes[i] for i in indices]
+                merged_text = ' '.join([b['text'] for b in group_boxes])
+                all_x = [b['x1'] for b in group_boxes] + [b['x2'] for b in group_boxes]
+                all_y = [b['y1'] for b in group_boxes] + [b['y2'] for b in group_boxes]
+                new_bbox = [
+                    [min(all_x), min(all_y)],
+                    [max(all_x), min(all_y)],
+                    [max(all_x), max(all_y)],
+                    [min(all_x), max(all_y)]
+                ]
+                avg_conf = sum(b['conf'] for b in group_boxes) / len(group_boxes)
+                merged.append((new_bbox, merged_text, avg_conf))
+
+        return merged
 
     def _ocr_with_fallback(self, img_np, _cjk, _step):
         img_h, img_w = img_np.shape[:2]

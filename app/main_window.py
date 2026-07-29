@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QListWidget, QLabel, QPushButton,
@@ -174,27 +175,39 @@ class RegionCanvas(QWidget):
 
     def __init__(self):
         super().__init__()
-        self._pixmap   = None
-        self._regions  = []
+        self._pixmap = None
+        self._regions = []
         self._selected = -1
-        self._mode     = None
-        self._drag_start   = None
-        self._orig_bbox    = None
+        self._mode = None
+        self._drag_start = None
+        self._orig_bbox = None
         self._resize_handle = None
-        self._draw_end     = None
+        self._draw_end = None
+
+        self._zoom = 1.0
+        self._fit_mode = True
+        self._offset_x = 0
+        self._offset_y = 0
+        self._pan_start = None
+        self._pan_start_offset = None
+
         self.setMouseTracking(True)
         self.setMinimumSize(300, 300)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def set_image(self, pil_img):
-        rgb  = pil_img.convert("RGB")
+        rgb = pil_img.convert("RGB")
         data = rgb.tobytes("raw", "RGB")
         qimg = QImage(data, rgb.width, rgb.height, rgb.width * 3, QImage.Format_RGB888)
         self._pixmap = QPixmap.fromImage(qimg)
+        self._zoom = 1.0
+        self._fit_mode = True
+        self._offset_x = 0
+        self._offset_y = 0
         self.update()
 
     def set_regions(self, regions):
-        self._regions  = regions
+        self._regions = regions
         self._selected = -1
         self.update()
 
@@ -220,8 +233,14 @@ class RegionCanvas(QWidget):
             return 0.0, 0.0, 1.0
         pw, ph = self._pixmap.width(), self._pixmap.height()
         ww, wh = self.width(), self.height()
-        scale  = min(ww / pw, wh / ph)
-        return (ww - pw * scale) / 2, (wh - ph * scale) / 2, scale
+        fit_scale = min(ww / pw, wh / ph)
+        if self._fit_mode:
+            scale = fit_scale
+        else:
+            scale = fit_scale * self._zoom
+        x0 = (ww - pw * scale) / 2 + self._offset_x
+        y0 = (wh - ph * scale) / 2 + self._offset_y
+        return x0, y0, scale
 
     def _to_widget(self, ix, iy):
         x0, y0, s = self._layout()
@@ -250,7 +269,7 @@ class RegionCanvas(QWidget):
         for i, r in enumerate(self._regions):
             x1, y1, x2, y2 = self._bbox_rect(r['bbox'])
             sel = (i == self._selected)
-            box_col  = QColor(255, 165, 0) if sel else QColor(80, 200, 120)
+            box_col = QColor(255, 165, 0) if sel else QColor(80, 200, 120)
             fill_col = QColor(box_col.red(), box_col.green(), box_col.blue(), 35)
             p.setPen(QPen(box_col, 2 if sel else 1))
             p.setBrush(fill_col)
@@ -273,40 +292,67 @@ class RegionCanvas(QWidget):
 
         p.end()
 
+    def wheelEvent(self, event):
+        if self._pixmap and (event.modifiers() & Qt.ControlModifier):
+            self._fit_mode = False
+            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+            self._zoom = max(0.1, min(8.0, self._zoom * factor))
+            self.update()
+            event.accept()
+        else:
+            event.ignore()
+
     def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        wx, wy = event.position().x(), event.position().y()
-
-        if self._selected >= 0:
-            h = self._hit_handle(wx, wy, self._selected)
-            if h:
-                self._mode          = 'resize'
-                self._resize_handle = h
-                self._drag_start    = (wx, wy)
-                self._orig_bbox     = [list(pt) for pt in self._regions[self._selected]['bbox']]
+        if event.button() == Qt.LeftButton:
+            if not self._fit_mode and self._pixmap:
+                self._pan_start = event.position().toPoint()
+                self._pan_start_offset = (self._offset_x, self._offset_y)
+                self.setCursor(Qt.ClosedHandCursor)
+                event.accept()
                 return
 
-        for i in range(len(self._regions) - 1, -1, -1):
-            if self._hit_region(wx, wy, i):
-                self._selected  = i
-                self._mode      = 'move'
-                self._drag_start = (wx, wy)
-                self._orig_bbox  = [list(pt) for pt in self._regions[i]['bbox']]
-                self.region_selected.emit(i)
-                self.update()
-                return
+            wx, wy = event.position().x(), event.position().y()
 
-        self._selected   = -1
-        self._mode       = 'draw'
-        self._drag_start = (wx, wy)
-        self._draw_end   = self._to_image(wx, wy)
-        self.region_selected.emit(-1)
-        self.update()
+            if self._selected >= 0:
+                h = self._hit_handle(wx, wy, self._selected)
+                if h:
+                    self._mode = 'resize'
+                    self._resize_handle = h
+                    self._drag_start = (wx, wy)
+                    self._orig_bbox = [list(pt) for pt in self._regions[self._selected]['bbox']]
+                    return
+
+            for i in range(len(self._regions) - 1, -1, -1):
+                if self._hit_region(wx, wy, i):
+                    self._selected = i
+                    self._mode = 'move'
+                    self._drag_start = (wx, wy)
+                    self._orig_bbox = [list(pt) for pt in self._regions[i]['bbox']]
+                    self.region_selected.emit(i)
+                    self.update()
+                    return
+
+            self._selected = -1
+            self._mode = 'draw'
+            self._drag_start = (wx, wy)
+            self._draw_end = self._to_image(wx, wy)
+            self.region_selected.emit(-1)
+            self.update()
+        else:
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._pan_start is not None:
+            delta = event.position().toPoint() - self._pan_start
+            self._offset_x = self._pan_start_offset[0] + delta.x()
+            self._offset_y = self._pan_start_offset[1] + delta.y()
+            self.update()
+            event.accept()
+            return
+
         if not self._mode:
             return
+
         wx, wy = event.position().x(), event.position().y()
         _, _, s = self._layout()
 
@@ -320,14 +366,14 @@ class RegionCanvas(QWidget):
 
         elif self._mode == 'resize':
             ix, iy = self._to_image(wx, wy)
-            orig   = self._orig_bbox
+            orig = self._orig_bbox
             ox1 = min(pt[0] for pt in orig); ox2 = max(pt[0] for pt in orig)
             oy1 = min(pt[1] for pt in orig); oy2 = max(pt[1] for pt in orig)
             coords = {
-                'tl': (ix,  iy,  ox2, oy2),
-                'tr': (ox1, iy,  ix,  oy2),
-                'bl': (ix,  oy1, ox2, iy),
-                'br': (ox1, oy1, ix,  iy),
+                'tl': (ix, iy, ox2, oy2),
+                'tr': (ox1, iy, ix, oy2),
+                'bl': (ix, oy1, ox2, iy),
+                'br': (ox1, oy1, ix, iy),
             }[self._resize_handle]
             nx1, ny1, nx2, ny2 = coords
             if nx2 - nx1 > 8 and ny2 - ny1 > 8:
@@ -341,36 +387,54 @@ class RegionCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
+        if event.button() == Qt.LeftButton:
+            if self._pan_start is not None:
+                self._pan_start = None
+                self._pan_start_offset = None
+                self.setCursor(Qt.ArrowCursor)
+                event.accept()
+                return
 
-        if self._mode == 'draw' and self._drag_start and self._draw_end:
-            ix1, iy1 = self._to_image(*self._drag_start)
-            ix2, iy2 = self._draw_end
-            if abs(ix2 - ix1) > 10 and abs(iy2 - iy1) > 10:
-                nx1, nx2 = min(ix1, ix2), max(ix1, ix2)
-                ny1, ny2 = min(iy1, iy2), max(iy1, iy2)
-                self._regions.append({
-                    'bbox': [[nx1, ny1], [nx2, ny1], [nx2, ny2], [nx1, ny2]],
-                    'text': '',
-                    'font_size': 12,
-                })
-                self._selected = len(self._regions) - 1
-                self.region_selected.emit(self._selected)
+            if self._mode == 'draw' and self._drag_start and self._draw_end:
+                ix1, iy1 = self._to_image(*self._drag_start)
+                ix2, iy2 = self._draw_end
+                if abs(ix2 - ix1) > 10 and abs(iy2 - iy1) > 10:
+                    nx1, nx2 = min(ix1, ix2), max(ix1, ix2)
+                    ny1, ny2 = min(iy1, iy2), max(iy1, iy2)
+                    self._regions.append({
+                        'bbox': [[nx1, ny1], [nx2, ny1], [nx2, ny2], [nx1, ny2]],
+                        'text': '',
+                        'font_size': 12,
+                    })
+                    self._selected = len(self._regions) - 1
+                    self.region_selected.emit(self._selected)
+                    self.regions_changed.emit()
+
+            elif self._mode in ('move', 'resize'):
                 self.regions_changed.emit()
 
-        elif self._mode in ('move', 'resize'):
-            self.regions_changed.emit()
+            self._mode = None
+            self.update()
+        else:
+            super().mouseReleaseEvent(event)
 
-        self._mode = None
-        self.update()
+    def mouseDoubleClickEvent(self, event):
+        if self._pixmap:
+            self._fit_mode = True
+            self._zoom = 1.0
+            self._offset_x = 0
+            self._offset_y = 0
+            self.update()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
 
     def _hit_region(self, wx, wy, idx):
         x1, y1, x2, y2 = self._bbox_rect(self._regions[idx]['bbox'])
         return x1 <= wx <= x2 and y1 <= wy <= y2
 
     def _hit_handle(self, wx, wy, idx):
-        h  = self._HANDLE
+        h = self._HANDLE
         x1, y1, x2, y2 = self._bbox_rect(self._regions[idx]['bbox'])
         for name, cx, cy in [('tl', x1, y1), ('tr', x2, y1),
                                ('bl', x1, y2), ('br', x2, y2)]:
@@ -417,7 +481,11 @@ class TextEditDialog(QDialog):
         main.setSpacing(8)
 
         left = QVBoxLayout()
-        hint = QLabel("Click a box to select • Drag to move • Drag corner to resize • Drag empty area to draw a new box")
+        hint = QLabel(
+            "Ctrl+scroll to zoom • Drag to pan • "
+            "Click a box to select • Drag to move • Drag corner to resize • "
+            "Drag empty area to draw a new box"
+        )
         hint.setStyleSheet("color: #aaa; font-size: 11px;")
         hint.setWordWrap(True)
         left.addWidget(hint)
@@ -447,6 +515,7 @@ class TextEditDialog(QDialog):
         self._table.setColumnWidth(0, 32)
         self._table.setColumnWidth(3, 62)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.setSelectionMode(QTableWidget.MultiSelection)
         self._table.itemSelectionChanged.connect(self._on_table_select)
         self._table.itemChanged.connect(self._on_table_item_changed)
 
@@ -455,9 +524,14 @@ class TextEditDialog(QDialog):
 
         right.addWidget(self._table, stretch=1)
 
-        btn_del = QPushButton("Delete Selected Region")
+        btn_layout = QHBoxLayout()
+        btn_del = QPushButton("Delete Selected")
         btn_del.clicked.connect(self._delete_selected)
-        right.addWidget(btn_del)
+        btn_merge = QPushButton("Merge Selected Rows")
+        btn_merge.clicked.connect(self._merge_selected)
+        btn_layout.addWidget(btn_del)
+        btn_layout.addWidget(btn_merge)
+        right.addLayout(btn_layout)
 
         grow = QHBoxLayout()
         grow.addWidget(QLabel("Set all sizes to:"))
@@ -507,6 +581,46 @@ class TextEditDialog(QDialog):
             item = self._table.item(row, 2)
             if item:
                 QApplication.clipboard().setText(item.text())
+
+    def _merge_selected(self):
+        selected_rows = sorted(set(index.row() for index in self._table.selectedIndexes()))
+        if len(selected_rows) < 2:
+            QMessageBox.information(self, "Merge", "Please select at least two rows to merge.")
+            return
+
+        self._collect_from_table()
+        merged_text = ' '.join(self._regions[i]['text'] for i in selected_rows)
+        merged_original = ' '.join(self._regions[i]['original_text'] for i in selected_rows)
+        merged_font_size = max(self._regions[i]['font_size'] for i in selected_rows)
+
+        all_x = []
+        all_y = []
+        for i in selected_rows:
+            bbox = self._regions[i]['bbox']
+            all_x.extend([p[0] for p in bbox])
+            all_y.extend([p[1] for p in bbox])
+
+        new_bbox = [
+            [min(all_x), min(all_y)],
+            [max(all_x), min(all_y)],
+            [max(all_x), max(all_y)],
+            [min(all_x), max(all_y)]
+        ]
+
+        new_regions = []
+        for i, r in enumerate(self._regions):
+            if i not in selected_rows:
+                new_regions.append(r)
+        new_regions.append({
+            'bbox': new_bbox,
+            'original_text': merged_original,
+            'text': merged_text,
+            'font_size': merged_font_size
+        })
+
+        self._regions = new_regions
+        self._refresh_table()
+        self._update_preview()
 
     def _refresh_table(self):
         prev_sel = self._canvas.get_selected()
@@ -574,8 +688,10 @@ class TextEditDialog(QDialog):
         self._preview_timer.start()
 
     def _delete_selected(self):
-        self._collect_from_table()
-        self._canvas.delete_selected()
+        selected_rows = sorted(set(index.row() for index in self._table.selectedIndexes()), reverse=True)
+        for row in selected_rows:
+            if 0 <= row < len(self._regions):
+                del self._regions[row]
         self._refresh_table()
 
     def _apply_size_all(self):
@@ -606,6 +722,7 @@ class TextEditDialog(QDialog):
             print(f"[TextEditDialog] Render error: {e}")
             import traceback; traceback.print_exc()
         self.accept()
+
 class ZonePickDialog(QDialog):
     def __init__(self, parent, file_path, existing_zones=None):
         super().__init__(parent)
@@ -624,6 +741,7 @@ class ZonePickDialog(QDialog):
         layout = QVBoxLayout(self)
 
         hint = QLabel(
+            "Ctrl+scroll to zoom • Drag to pan • "
             "Drag on the image to mark zones where the auto-detector missed text. "
             "Click a box to select it; drag to move; drag a corner handle to resize."
         )
