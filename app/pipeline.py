@@ -51,7 +51,7 @@ class ComicTranslationPipeline:
             _step("No text found — skipping.")
             return pil_orig, pil_orig.copy(), []
 
-        results = self._merge_text_boxes(results)
+        results = self._merge_text_boxes(results, img_np.shape[1], img_np.shape[0])
 
         texts = [r[1] for r in results]
         _step(f"Translating {len(texts)} text region(s)…")
@@ -88,17 +88,75 @@ class ComicTranslationPipeline:
 
         return img_pil, base_pil, regions
 
-    def _get_merge_preset(self):
-        if self.source_lang == "ko":
-            return {'gap_factor': 2.5, 'align_tol': 0.5, 'overlap_req': 0.0}
-        elif self.source_lang in ("ja", "ja_manga"):
-            return {'gap_factor': 2.0, 'align_tol': 0.4, 'overlap_req': 0.3}
-        elif self.source_lang in ("ch_sim", "ch_tra"):
-            return {'gap_factor': 2.0, 'align_tol': 0.5, 'overlap_req': 0.0}
-        else:
-            return {'gap_factor': 2.0, 'align_tol': 0.5, 'overlap_req': 0.0}
+    def _ocr_with_fallback(self, img_np, _cjk, _step):
+        img_h, img_w = img_np.shape[:2]
 
-    def _merge_text_boxes(self, results):
+        if self.source_lang == "auto":
+            kwargs = dict(text_threshold=0.5, low_text=0.3, paragraph=False)
+            min_conf = 0.15
+        elif _cjk:
+            kwargs = dict(text_threshold=0.6, low_text=0.35, paragraph=False)
+            min_conf = 0.1
+        else:
+            kwargs = dict(paragraph=False)
+            min_conf = 0.3
+
+        results = self.ocr_reader.readtext(img_np, detail=1, **kwargs)
+        if results is None:
+            results = []
+        results = self._filter(results, min_conf, max_box_area=img_h * img_w * 0.12, alphanumeric=True)
+
+        if results:
+            return results
+
+        _step("No text found — retrying with relaxed settings…")
+        results = self.ocr_reader.readtext(
+            img_np, detail=1, paragraph=False,
+            text_threshold=0.4, low_text=0.3,
+        )
+        if results is None:
+            results = []
+        results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5, alphanumeric=False)
+
+        if results:
+            return results
+
+        _step("Retrying with rotation detection…")
+        try:
+            results = self.ocr_reader.readtext(
+                img_np, detail=1, paragraph=False,
+                text_threshold=0.4, low_text=0.3,
+                rotation_info=[90, 180, 270],
+            )
+        except TypeError:
+            results = []
+        if results is None:
+            results = []
+        results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5, alphanumeric=False)
+        return results
+
+    def _filter(self, results, min_conf, max_box_area, alphanumeric):
+        out = []
+        for r in results:
+            if not isinstance(r, (list, tuple)) or len(r) < 3:
+                continue
+            bbox, text, conf = r[0], r[1], r[2]
+            if conf <= min_conf:
+                continue
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            area = (max(xs) - min(xs)) * (max(ys) - min(ys))
+            if area >= max_box_area:
+                continue
+            if alphanumeric and not any(c.isalnum() for c in text):
+                continue
+            out.append(r)
+        return out
+
+    def _merge_text_boxes(self, results, img_w, img_h):
+        """
+        Cluster boxes using centroid distance.
+        """
         if len(results) <= 1:
             return results
 
@@ -108,16 +166,22 @@ class ComicTranslationPipeline:
             ys = [p[1] for p in bbox]
             x1, x2 = min(xs), max(xs)
             y1, y2 = min(ys), max(ys)
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
             boxes.append({
                 'bbox': bbox,
                 'text': text,
                 'conf': conf,
+                'cx': cx,
+                'cy': cy,
                 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'cx': (x1 + x2) / 2,
-                'cy': (y1 + y2) / 2,
                 'width': x2 - x1,
                 'height': y2 - y1
             })
+
+        heights = [b['height'] for b in boxes]
+        median_h = sorted(heights)[len(heights)//2] if heights else 20
+        radius = 2.0 * median_h
 
         n = len(boxes)
         parent = list(range(n))
@@ -133,52 +197,19 @@ class ComicTranslationPipeline:
             if ra != rb:
                 parent[rb] = ra
 
-        preset = self._get_merge_preset()
-        gap_factor = preset['gap_factor']
-        align_tol = preset['align_tol']
-        overlap_req = preset['overlap_req']
-
-        def should_connect(i, j):
-            a, b = boxes[i], boxes[j]
-            a_vert = a['height'] > a['width'] * 1.5
-            b_vert = b['height'] > b['width'] * 1.5
-
-            if a_vert != b_vert:
-                return False
-
-            if a_vert:
-                if abs(a['cx'] - b['cx']) > max(a['width'], b['width']) * align_tol:
-                    return False
-                gap = min(a['y2'], b['y2']) - max(a['y1'], b['y1'])
-                if gap < -max(a['height'], b['height']) * 0.5:
-                    return False
-                if abs(a['y1'] - b['y1']) > max(a['height'], b['height']) * gap_factor:
-                    return False
-                if overlap_req > 0:
-                    overlap_x = max(0, min(a['x2'], b['x2']) - max(a['x1'], b['x1']))
-                    min_width = min(a['width'], b['width'])
-                    if min_width > 0 and overlap_x / min_width < overlap_req:
-                        return False
-                return True
-            else:
-                if abs(a['cy'] - b['cy']) > max(a['height'], b['height']) * align_tol:
-                    return False
-                gap = min(a['x2'], b['x2']) - max(a['x1'], b['x1'])
-                if gap < -max(a['width'], b['width']) * 0.5:
-                    return False
-                if abs(a['x1'] - b['x1']) > max(a['width'], b['width']) * gap_factor:
-                    return False
-                if overlap_req > 0:
-                    overlap_y = max(0, min(a['y2'], b['y2']) - max(a['y1'], b['y1']))
-                    min_height = min(a['height'], b['height'])
-                    if min_height > 0 and overlap_y / min_height < overlap_req:
-                        return False
-                return True
-
         for i in range(n):
-            for j in range(i + 1, n):
-                if should_connect(i, j):
-                    union(i, j)
+            for j in range(i+1, n):
+                dx = boxes[i]['cx'] - boxes[j]['cx']
+                dy = boxes[i]['cy'] - boxes[j]['cy']
+                dist = math.hypot(dx, dy)
+                if dist < radius:
+                    merged_x1 = min(boxes[i]['x1'], boxes[j]['x1'])
+                    merged_y1 = min(boxes[i]['y1'], boxes[j]['y1'])
+                    merged_x2 = max(boxes[i]['x2'], boxes[j]['x2'])
+                    merged_y2 = max(boxes[i]['y2'], boxes[j]['y2'])
+                    area = (merged_x2 - merged_x1) * (merged_y2 - merged_y1)
+                    if area < 0.20 * img_w * img_h:
+                        union(i, j)
 
         groups = {}
         for i in range(n):
@@ -206,62 +237,7 @@ class ComicTranslationPipeline:
 
         return merged
 
-    def _ocr_with_fallback(self, img_np, _cjk, _step):
-        img_h, img_w = img_np.shape[:2]
-
-        if self.source_lang == "auto":
-            kwargs   = dict(text_threshold=0.5, low_text=0.3)
-            min_conf = 0.15
-        elif _cjk:
-            kwargs   = dict(text_threshold=0.6, low_text=0.35)
-            min_conf = 0.1
-        else:
-            kwargs   = {}
-            min_conf = 0.3
-
-        results = self.ocr_reader.readtext(img_np, detail=1, paragraph=False, **kwargs)
-
-        max_box_area = img_h * img_w * 0.12
-        results = self._filter(results, min_conf, max_box_area, alphanumeric=True)
-
-        if results:
-            return results
-
-        _step("No text found — retrying with relaxed settings…")
-        results = self.ocr_reader.readtext(
-            img_np, detail=1, paragraph=False,
-            text_threshold=0.4, low_text=0.3,
-        )
-        results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5,
-                               alphanumeric=False)
-
-        if results:
-            return results
-
-        _step("Retrying with rotation detection…")
-        try:
-            results = self.ocr_reader.readtext(
-                img_np, detail=1, paragraph=False,
-                text_threshold=0.4, low_text=0.3,
-                rotation_info=[90, 180, 270],
-            )
-        except TypeError:
-            results = []
-        results = self._filter(results, min_conf=0.1, max_box_area=img_h * img_w * 0.5,
-                               alphanumeric=False)
-        return results
-
-    def _filter(self, results, min_conf, max_box_area, alphanumeric):
-        out = [r for r in results if r[2] > min_conf]
-        out = [
-            r for r in out
-            if (max(p[0] for p in r[0]) - min(p[0] for p in r[0])) *
-               (max(p[1] for p in r[0]) - min(p[1] for p in r[0])) < max_box_area
-        ]
-        if alphanumeric:
-            out = [r for r in out if any(c.isalnum() for c in r[1])]
-        return out
-
+    # ---------- rest unchanged except _render (no rectangle) ----------
     _CJK_RANGES = [
         ('一', '鿿'),
         ('぀', 'ゟ'),
@@ -285,8 +261,7 @@ class ComicTranslationPipeline:
             try:
                 result = self.translator.translate(text)
                 translated = result.strip() if result else ""
-                if translated and self._has_cjk(translated) and \
-                        self.target_lang in self._LATIN_TARGETS:
+                if translated and self._has_cjk(translated) and self.target_lang in self._LATIN_TARGETS:
                     translated = ""
                 out.append(translated)
             except Exception:
@@ -337,9 +312,6 @@ class ComicTranslationPipeline:
             return font_size or 10
 
         is_vertical = self._is_vertical_box(x1, y1, x2, y2)
-        original_w = box_w
-        original_h = box_h
-
         MIN_RENDER_W = 60
         if not is_vertical and box_w < MIN_RENDER_W:
             cx = (x1 + x2) // 2
@@ -356,10 +328,10 @@ class ComicTranslationPipeline:
                 x2 = min(img_pil.width, x1 + new_w)
                 box_w = x2 - x1
 
+        # Determine text color based on the region's dominant color (for contrast)
         region = img_pil.crop((x1, y1, x2, y2))
         bg = self._dominant_color(region)
         fg = self._contrast_color(bg)
-        draw.rectangle([x1, y1, x2, y2], fill=bg)
 
         min_size = 5 if is_vertical else 7
 
@@ -405,7 +377,7 @@ class ComicTranslationPipeline:
         bg = self._dominant_color(region)
         fg = self._contrast_color(bg)
 
-        tile = Image.new("RGBA", (box_w, box_h), bg + (255,))
+        tile = Image.new("RGBA", (box_w, box_h), (0,0,0,0))  # transparent tile
         tile_draw = ImageDraw.Draw(tile)
 
         if font_size:

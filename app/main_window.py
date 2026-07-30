@@ -1,4 +1,5 @@
 from pathlib import Path
+from PIL import Image
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -443,13 +444,13 @@ class RegionCanvas(QWidget):
         return None
 
 class TextEditDialog(QDialog):
-    def __init__(self, parent, file_path, base_img, regions, target_lang):
+    def __init__(self, parent, file_path, original_img, regions, target_lang):
         super().__init__(parent)
         self.setWindowTitle(f"Edit Texts — {Path(file_path).name}")
         self.setMinimumSize(960, 640)
         self.resize(1200, 760)
 
-        self._base_img    = base_img
+        self._original_img = original_img
         self._target_lang = target_lang
         self._pipeline    = None
         self.result_image = None
@@ -491,7 +492,7 @@ class TextEditDialog(QDialog):
         left.addWidget(hint)
 
         self._canvas = RegionCanvas()
-        self._canvas.set_image(self._base_img)
+        self._canvas.set_image(self._original_img)
         self._canvas.region_selected.connect(self._on_canvas_select)
         self._canvas.regions_changed.connect(self._on_regions_changed)
 
@@ -527,7 +528,7 @@ class TextEditDialog(QDialog):
         btn_layout = QHBoxLayout()
         btn_del = QPushButton("Delete Selected")
         btn_del.clicked.connect(self._delete_selected)
-        btn_merge = QPushButton("Merge Selected Rows")
+        btn_merge = QPushButton("Merge & Retranslate")   # changed label
         btn_merge.clicked.connect(self._merge_selected)
         btn_layout.addWidget(btn_del)
         btn_layout.addWidget(btn_merge)
@@ -582,6 +583,20 @@ class TextEditDialog(QDialog):
             if item:
                 QApplication.clipboard().setText(item.text())
 
+    # ---------- NEW helper: translate with Google (lightweight fallback) ----------
+    def _translate_with_google(self, text: str) -> str:
+        if not text:
+            return ""
+        try:
+            from deep_translator import GoogleTranslator
+            t = GoogleTranslator(source="auto", target=self._target_lang)
+            result = t.translate(text)
+            return result.strip() if result else ""
+        except Exception as e:
+            print(f"[TextEditDialog] Google translate failed: {e}")
+            return ""
+
+    # ---------- UPDATED merge: now merges original texts and retranslates ----------
     def _merge_selected(self):
         selected_rows = sorted(set(index.row() for index in self._table.selectedIndexes()))
         if len(selected_rows) < 2:
@@ -589,7 +604,8 @@ class TextEditDialog(QDialog):
             return
 
         self._collect_from_table()
-        merged_text = ' '.join(self._regions[i]['text'] for i in selected_rows)
+
+        # Collect original texts and bbox of selected rows
         merged_original = ' '.join(self._regions[i]['original_text'] for i in selected_rows)
         merged_font_size = max(self._regions[i]['font_size'] for i in selected_rows)
 
@@ -607,21 +623,27 @@ class TextEditDialog(QDialog):
             [min(all_x), max(all_y)]
         ]
 
-        new_regions = []
-        for i, r in enumerate(self._regions):
-            if i not in selected_rows:
-                new_regions.append(r)
-        new_regions.append({
+        # Remove selected rows (reverse order)
+        for i in sorted(selected_rows, reverse=True):
+            del self._regions[i]
+
+        # Re-translate the merged original text (Google fallback)
+        translated_text = self._translate_with_google(merged_original)
+        if not translated_text:
+            translated_text = merged_original  # fallback to original if translate fails
+
+        # Add the new merged region
+        self._regions.append({
             'bbox': new_bbox,
             'original_text': merged_original,
-            'text': merged_text,
+            'text': translated_text,
             'font_size': merged_font_size
         })
 
-        self._regions = new_regions
         self._refresh_table()
         self._update_preview()
 
+    # ---------- rest of the class unchanged ----------
     def _refresh_table(self):
         prev_sel = self._canvas.get_selected()
         self._table.blockSignals(True)
@@ -708,7 +730,7 @@ class TextEditDialog(QDialog):
         self._update_preview()
 
     def _update_preview(self):
-        img = self._get_pipeline().render_from_regions(self._base_img, self._regions)
+        img = self._get_pipeline().render_from_regions(self._original_img, self._regions)
         self._canvas.set_image(img)
 
     def _save_and_close(self):
@@ -716,72 +738,12 @@ class TextEditDialog(QDialog):
         self._collect_from_table()
         try:
             self.result_image = self._get_pipeline().render_from_regions(
-                self._base_img, self._regions
+                self._original_img, self._regions
             )
         except Exception as e:
             print(f"[TextEditDialog] Render error: {e}")
             import traceback; traceback.print_exc()
         self.accept()
-
-class ZonePickDialog(QDialog):
-    def __init__(self, parent, file_path, existing_zones=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Mark Zones — {Path(file_path).name}")
-        self.setMinimumSize(700, 560)
-        self.resize(960, 700)
-
-        self._regions = [
-            {'bbox': z, 'text': '', 'font_size': 12}
-            for z in (existing_zones or [])
-        ]
-        self._file_path = file_path
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-
-        hint = QLabel(
-            "Ctrl+scroll to zoom • Drag to pan • "
-            "Drag on the image to mark zones where the auto-detector missed text. "
-            "Click a box to select it; drag to move; drag a corner handle to resize."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #aaa; font-size: 11px;")
-        layout.addWidget(hint)
-
-        self._canvas = RegionCanvas()
-        scroll = QScrollArea()
-        scroll.setWidget(self._canvas)
-        scroll.setWidgetResizable(True)
-        layout.addWidget(scroll, stretch=1)
-
-        from PIL import Image as PilImage
-        pil = PilImage.open(self._file_path).convert("RGB")
-        self._canvas.set_image(pil)
-        self._canvas.set_regions(self._regions)
-
-        brow = QHBoxLayout()
-        brow.addStretch()
-        btn_clear = QPushButton("Clear All")
-        btn_ok    = QPushButton("Save Zones")
-        btn_cancel = QPushButton("Cancel")
-        btn_ok.setStyleSheet(
-            "background-color: #5a9e5a; color: white; font-weight: bold; padding: 0 14px;"
-        )
-        btn_clear.clicked.connect(self._clear_all)
-        btn_ok.clicked.connect(self.accept)
-        btn_cancel.clicked.connect(self.reject)
-        for b in (btn_clear, btn_ok, btn_cancel):
-            b.setFixedHeight(32)
-            brow.addWidget(b)
-        layout.addLayout(brow)
-
-    def _clear_all(self):
-        self._regions.clear()
-        self._canvas.set_regions(self._regions)
-
-    def get_zones(self):
-        return [r['bbox'] for r in self._canvas.get_regions()]
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1149,7 +1111,8 @@ class MainWindow(QMainWindow):
             return
 
         ed = self.edit_data[path]
-        dlg = TextEditDialog(self, path, ed['base'], ed['regions'], ed['target_lang'])
+        original_img = Image.open(path).convert("RGB")
+        dlg = TextEditDialog(self, path, original_img, ed['regions'], ed['target_lang'])
         if dlg.exec() == QDialog.Accepted and dlg.result_image is not None:
             self.translated[path] = dlg.result_image
             self.edit_data[path]['regions'] = [dict(r) for r in dlg._regions]
