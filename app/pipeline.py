@@ -7,6 +7,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
+def _log_mem(label):
+    try:
+        import psutil
+        mb = psutil.Process().memory_info().rss / 1024 / 1024
+        print(f"[mem] {label}: {mb:.0f} MB")
+    except Exception:
+        pass
+
+
 class ComicTranslationPipeline:
     _NO_SPACE_SOURCES = {"ja", "ja_manga", "ch_sim", "ch_tra"}
 
@@ -28,6 +37,7 @@ class ComicTranslationPipeline:
     CROP_MIN_CONF_TO_SKIP     = 0.75
     CROP_MIN_CONF_GAIN        = 0.15
     CROP_REPLACEMENT_MIN_CONF = 0.40
+    CROP_MIN_UPSCALE          = 2.0
 
     RAW_TOP_MARGIN_FRAC    = 1.50
     RAW_SIDE_MARGIN_FRAC   = 0.30
@@ -119,9 +129,9 @@ class ComicTranslationPipeline:
 
             crop = ocr_input[cy1:cy2, cx1:cx2]
 
-            if ocr_scale != 1.0:
-                crop = cv2.resize(crop, None, fx=ocr_scale, fy=ocr_scale,
-                                  interpolation=cv2.INTER_CUBIC)
+            refine_scale = max(ocr_scale, self.CROP_MIN_UPSCALE)
+            crop = cv2.resize(crop, None, fx=refine_scale, fy=refine_scale,
+                              interpolation=cv2.INTER_CUBIC)
 
             try:
                 crop_results = self.ocr_reader.readtext(
@@ -204,6 +214,8 @@ class ComicTranslationPipeline:
         h_img, w_img = raw_img.shape[:2]
         out = []
 
+        _log_mem(f"before raw-augment ({len(dialogues)} dialogues)")
+
         bboxes = [self._dialogue_bbox(d) for d in dialogues]
 
         for idx, dlg in enumerate(dialogues):
@@ -218,7 +230,6 @@ class ComicTranslationPipeline:
                 out.append(dlg)
                 continue
 
-            # Find nearest dialogue above and below
             top_limit = 0
             for j in range(idx):
                 if bboxes[j] is not None and bboxes[j][3] < y1:
@@ -252,10 +263,8 @@ class ComicTranslationPipeline:
             else:
                 ey2 = min(h_img, naive_bot)
 
-            ey1 = int(ey1)
-            ey2 = int(ey2)
-            ex1 = int(ex1)
-            ex2 = int(ex2)
+            ey1 = int(ey1); ey2 = int(ey2)
+            ex1 = int(ex1); ex2 = int(ex2)
 
             if ey2 - ey1 < 16 or ex2 - ex1 < 16:
                 if debug:
@@ -266,11 +275,9 @@ class ComicTranslationPipeline:
 
             crop = raw_img[ey1:ey2, ex1:ex2]
 
-            if ocr_scale != 1.0:
-                crop_work = cv2.resize(crop, None, fx=ocr_scale, fy=ocr_scale,
-                                       interpolation=cv2.INTER_CUBIC)
-            else:
-                crop_work = crop
+            augment_scale = max(ocr_scale, self.CROP_MIN_UPSCALE)
+            crop_work = cv2.resize(crop, None, fx=augment_scale, fy=augment_scale,
+                                   interpolation=cv2.INTER_CUBIC)
 
             try:
                 raw_results = self.ocr_reader.readtext(
@@ -291,8 +298,8 @@ class ComicTranslationPipeline:
             raw_page = []
             for bb_, t, c in raw_results:
                 try:
-                    xs_b = [float(p[0]) / ocr_scale + ex1 for p in bb_]
-                    ys_b = [float(p[1]) / ocr_scale + ey1 for p in bb_]
+                    xs_b = [float(p[0]) / augment_scale + ex1 for p in bb_]
+                    ys_b = [float(p[1]) / augment_scale + ey1 for p in bb_]
                     x1_b = min(xs_b); x2_b = max(xs_b)
                     y1_b = min(ys_b); y2_b = max(ys_b)
                     quad = [[x1_b, y1_b], [x2_b, y1_b],
@@ -445,7 +452,9 @@ class ComicTranslationPipeline:
                     pass
         else:
             _step("Running OCR…")
+            _log_mem("before OCR")
             results = self._ocr_with_fallback(work, _cjk, _step)
+            _log_mem("after OCR")
 
         if os.environ.get("CT_DEBUG"):
             print(f"[pipeline] OCR OUTPUT ({len(results)} boxes, from preprocessed image):")
@@ -849,6 +858,15 @@ class ComicTranslationPipeline:
     def _has_cjk(self, text):
         return any(low <= c <= high for c in text for low, high in self._CJK_RANGES)
 
+    def _is_entirely_cjk(self, text):
+        letters = [c for c in text if c.isalpha()]
+        if not letters:
+            return False
+        return all(
+            any(low <= c <= high for low, high in self._CJK_RANGES)
+            for c in letters
+        )
+
     _LATIN_TARGETS = {"en", "es", "fr", "de", "pt", "ru", "it", "vi", "th"}
 
     def _translate_texts(self, texts):
@@ -871,17 +889,23 @@ class ComicTranslationPipeline:
                 translated = result.strip()
                 blanked = False
                 if (translated
-                        and self._has_cjk(translated)
+                        and self._is_entirely_cjk(translated)
                         and self.target_lang in self._LATIN_TARGETS):
                     blanked = True
                     translated = ""
                 if debug:
-                    note = "  [BLANKED: still CJK]" if blanked else ""
+                    note = "  [BLANKED: entirely CJK]" if blanked else ""
                     print(f"[pipeline] translate[{i:02d}] {text!r} -> {translated!r}{note}")
                 out.append(translated)
             except Exception as e:
                 if debug:
-                    print(f"[pipeline] translate[{i:02d}] FAILED {text!r}: {e!r}")
+                    print(f"[pipeline] translate[{i:02d}] FAILED {text!r}: "
+                          f"{type(e).__name__}: {e!r}")
+                    try:
+                        import traceback as _tb
+                        _tb.print_exc()
+                    except Exception:
+                        pass
                 out.append("")
         return out
 

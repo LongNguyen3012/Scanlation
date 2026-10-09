@@ -49,6 +49,7 @@ TRANSLATION_SERVICES = [
     "Google Translate",
     "OPUS-MT (Offline)",
     "NLLB (Offline)",
+    "LFM2 (Korean)",
 ]
 
 _GOOGLE_SRC_CODES = {

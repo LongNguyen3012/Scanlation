@@ -1,3 +1,4 @@
+import gc
 import threading
 import time
 import traceback
@@ -13,6 +14,16 @@ GOOGLE_TARGET_CODES = {
     "es": "es", "fr": "fr", "de": "de", "pt": "pt",
     "ru": "ru", "it": "it", "vi": "vi", "th": "th",
 }
+
+
+def _log_mem(label):
+    mb = None
+    try:
+        import psutil
+        mb = psutil.Process().memory_info().rss / 1024 / 1024
+    except Exception:
+        return
+    print(f"[mem] {label}: {mb:.0f} MB")
 
 
 class _ThrottledTranslator:
@@ -50,6 +61,9 @@ class PaddleOCRWrapper:
     def __init__(self, lang: str = "korean", use_gpu: bool = False):
         from paddleocr import PaddleOCR
 
+        det_limit = 1920
+        det_model = "PP-OCRv5_mobile_det"
+
         paddle_lang_map = {
             "ko": "korean",
             "ja": "japan",
@@ -59,14 +73,27 @@ class PaddleOCRWrapper:
         }
         self._lang = paddle_lang_map.get(lang, "korean")
 
+        rec_map = {
+            "korean":      "korean_PP-OCRv5_mobile_rec",
+            "japan":       "japan_PP-OCRv3_mobile_rec",
+            "ch":          "PP-OCRv5_mobile_rec",
+            "chinese_cht": "chinese_cht_PP-OCRv3_mobile_rec",
+            "en":          "en_PP-OCRv5_mobile_rec",
+        }
+        rec_model = rec_map.get(self._lang, "PP-OCRv5_mobile_rec")
+
         try:
             self._ocr = PaddleOCR(
-                lang=self._lang,
                 enable_mkldnn=False,
                 use_textline_orientation=True,
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
+                text_detection_model_name=det_model,
+                text_recognition_model_name=rec_model,
+                text_det_limit_side_len=det_limit,
+                text_det_limit_type="max",
             )
+            self._bounded = True
         except TypeError:
             self._ocr = PaddleOCR(
                 use_angle_cls=True,
@@ -75,8 +102,16 @@ class PaddleOCRWrapper:
                 show_log=False,
                 enable_mkldnn=False,
             )
+            self._bounded = False
 
-        print(f"[PaddleOCR] Initialised with lang='{self._lang}' (mkldnn disabled)")
+        if self._bounded:
+            print(f"[PaddleOCR] Initialised lang='{self._lang}' "
+                  f"det='{det_model}' rec='{rec_model}' "
+                  f"det_limit={det_limit}/max")
+        else:
+            print(f"[PaddleOCR] Initialised lang='{self._lang}' "
+                  f"(FALLBACK — memory limits NOT applied)")
+        _log_mem("after PaddleOCR init")
 
     def readtext(self, img_np, **kwargs):
         if img_np.ndim == 3 and img_np.shape[2] == 3:
@@ -233,11 +268,13 @@ class OpusMTTranslator:
 
 class NLLBTranslator:
     def __init__(self, from_ocr_code: str, to_code: str,
-                 model_name: str = "facebook/nllb-200-3.3B"):
+                 model_name: str = "facebook/nllb-200-distilled-600M"):
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        self.model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name, use_safetensors=False
+        )
         if torch.cuda.is_available():
             self.model = self.model.to("cuda")
         self.model.eval()
@@ -273,9 +310,63 @@ class NLLBTranslator:
                 max_length=512,
                 num_beams=1,
                 do_sample=False,
-                early_stopping=True,
             )
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+
+class LFM2KoEnTranslator:
+    """
+    LFM2 Korean→English translator.
+
+    Uses raw text prompt format ("Translate Korean to English...") because
+    the model was fine-tuned as a translation model, not a chat model.
+    Anti-repetition parameters run under greedy search (do_sample=False)
+    so output is deterministic across runs.
+    """
+    def __init__(self, from_ocr_code: str, to_code: str):
+        if from_ocr_code != "ko" or to_code != "en":
+            raise ValueError(
+                f"LFM2-1.2B-KoEn-MT supports only ko→en, "
+                f"got {from_ocr_code}→{to_code}"
+            )
+
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self._torch = torch
+
+        model_id = "gyung/lfm2-1.2b-koen-mt-v6.4-merged"
+        print(f"[LFM2KoEn] Loading {model_id}…")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+        if hasattr(self.tokenizer, "clean_up_tokenization_spaces"):
+            self.tokenizer.clean_up_tokenization_spaces = False
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            dtype=torch.float32,
+        )
+        self.model.eval()
+        print("[LFM2KoEn] Loaded")
+
+    def translate(self, text: str) -> str:
+        prompt = f"Translate Korean to English.\nKorean: {text}\nEnglish:"
+
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        prompt_len = inputs["input_ids"].shape[1]
+
+        with self._torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=256,
+                do_sample=False,
+                repetition_penalty=1.25,
+                no_repeat_ngram_size=3,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        generated_ids = outputs[0][prompt_len:]
+        result = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        return result.strip()
 
 
 class TranslationWorker(QThread):
@@ -311,6 +402,8 @@ class TranslationWorker(QThread):
         target_lang = self.settings["target_lang"]
         service = self.settings["service"]
 
+        _log_mem("worker start")
+
         if source_lang == "ja_manga":
             self.progress.emit(0, "Loading Manga OCR — first run downloads ~450 MB…")
             reader = MangaOCRWrapper()
@@ -331,6 +424,8 @@ class TranslationWorker(QThread):
             self.fatal_error.emit(str(e))
             return
 
+        _log_mem("after translator init")
+
         pipeline = ComicTranslationPipeline(
             source_lang=source_lang,
             target_lang=target_lang,
@@ -346,6 +441,9 @@ class TranslationWorker(QThread):
             name = Path(file_path).name
             self.progress.emit(i, f"Page {i + 1} of {len(self.files)}  —  {name}")
             self.step.emit("")
+
+            _log_mem(f"before page {i+1}")
+
             forced = manual_zones.get(file_path, [])
             print(f"[TranslationWorker] Processing {name}  forced_zones={len(forced)}")
             try:
@@ -365,6 +463,10 @@ class TranslationWorker(QThread):
                 self.error.emit(f"Skipped {name}: {e}")
                 traceback.print_exc()
 
+            _log_mem(f"after page {i+1}")
+            gc.collect()
+            _log_mem(f"after gc {i+1}")
+
         self.progress.emit(len(self.files), "Done!")
 
     def _build_translator(self, service, source_lang, target_lang):
@@ -379,13 +481,13 @@ class TranslationWorker(QThread):
                 target=GOOGLE_TARGET_CODES.get(target_lang, target_lang),
             )
             print("[TranslationWorker] Google Translate ready (throttled)")
-            return _ThrottledTranslator(raw, delay=2.5, timeout=30.0)
+            return _ThrottledTranslator(raw, delay=5.0, timeout=30.0)
 
         elif service == "OPUS-MT (Offline)":
             opus_src = source_lang
             self.progress.emit(
                 0,
-                f"Loading OPUS-MT {opus_src}→{target_lang} — first run downloads ~350 MB…"
+                f"Loading OPUS-MT {opus_src}→{target_lang} — first run downloads ~300 MB…"
             )
             print(f"[TranslationWorker] Loading OPUS-MT {opus_src}→{target_lang}")
             t = OpusMTTranslator(opus_src, target_lang)
@@ -395,11 +497,21 @@ class TranslationWorker(QThread):
         elif service == "NLLB (Offline)":
             self.progress.emit(
                 0,
-                "Loading NLLB-200 3.3B — first run downloads ~6.5 GB…"
+                "Loading NLLB-200 (distilled 600M) — first run downloads ~2.5 GB…"
             )
-            print("[TranslationWorker] Loading NLLB-200 3.3B")
+            print("[TranslationWorker] Loading NLLB-200 distilled 600M")
             t = NLLBTranslator(source_lang, target_lang)
             print("[TranslationWorker] NLLB ready")
+            return t
+
+        elif service == "LFM2 (Korean)":
+            self.progress.emit(
+                0,
+                "Loading LFM2-1.2B-KoEn-MT — first run downloads ~2.5 GB…"
+            )
+            print("[TranslationWorker] Loading LFM2-1.2B-KoEn-MT")
+            t = LFM2KoEnTranslator(source_lang, target_lang)
+            print("[TranslationWorker] LFM2 ready")
             return t
 
         raise ValueError(f"Unknown service: {service!r}")

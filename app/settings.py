@@ -5,7 +5,7 @@ APPDATA_DIR = Path.home() / "AppData" / "Roaming" / "ComicTranslator"
 _FILE       = APPDATA_DIR / "settings.json"
 
 DEFAULTS: dict = {
-    "source_lang":     "English",
+    "source_lang":     "Korean",
     "target_lang":     "English",
     "service":         "OPUS-MT (Offline)",
     "output_dir":      "",
