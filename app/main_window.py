@@ -21,7 +21,6 @@ SUPPORTED_EXTENSIONS = {
 }
 
 SOURCE_LANGUAGES = {
-    "Auto-detect":                 "auto",
     "Japanese":                    "ja",
     "Japanese (Manga OCR)":        "ja_manga",
     "Korean":                      "ko",
@@ -51,6 +50,16 @@ TRANSLATION_SERVICES = [
     "OPUS-MT (Offline)",
     "NLLB (Offline)",
 ]
+
+_GOOGLE_SRC_CODES = {
+    "ja":      "ja",
+    "ja_manga": "ja",
+    "ko":      "ko",
+    "ch_sim":  "zh-CN",
+    "ch_tra":  "zh-TW",
+    "en":      "en",
+}
+
 
 class ImageViewer(QLabel):
     def __init__(self, placeholder="No image"):
@@ -167,6 +176,7 @@ class ImageViewer(QLabel):
         if self._fit_mode:
             self._refresh()
         super().resizeEvent(event)
+
 
 class RegionCanvas(QWidget):
     region_selected = Signal(int)
@@ -443,16 +453,21 @@ class RegionCanvas(QWidget):
                 return name
         return None
 
+
 class TextEditDialog(QDialog):
-    def __init__(self, parent, file_path, original_img, regions, target_lang):
+    def __init__(self, parent, file_path, base_img, regions,
+                 source_lang, target_lang, service):
         super().__init__(parent)
         self.setWindowTitle(f"Edit Texts — {Path(file_path).name}")
         self.setMinimumSize(960, 640)
         self.resize(1200, 760)
 
-        self._original_img = original_img
+        self._base_img    = base_img
+        self._source_lang = source_lang
         self._target_lang = target_lang
+        self._service     = service
         self._pipeline    = None
+        self._translator  = None
         self.result_image = None
 
         self._regions = [dict(r) for r in regions]
@@ -470,12 +485,43 @@ class TextEditDialog(QDialog):
         if self._pipeline is None:
             from app.pipeline import ComicTranslationPipeline
             self._pipeline = ComicTranslationPipeline(
-                source_lang="en",
+                source_lang=self._source_lang,
                 target_lang=self._target_lang,
                 ocr_reader=None,
                 translator=None,
             )
         return self._pipeline
+
+    def _get_translator(self):
+        if self._translator is not None:
+            return self._translator
+        svc = self._service or "OPUS-MT (Offline)"
+        if svc == "OPUS-MT (Offline)":
+            from app.worker import OpusMTTranslator
+            self._translator = OpusMTTranslator(self._source_lang, self._target_lang)
+        elif svc == "NLLB (Offline)":
+            from app.worker import NLLBTranslator
+            self._translator = NLLBTranslator(self._source_lang, self._target_lang)
+        else:
+            from deep_translator import GoogleTranslator
+            from app.worker import _ThrottledTranslator, GOOGLE_TARGET_CODES
+            src = _GOOGLE_SRC_CODES.get(self._source_lang, "auto")
+            raw = GoogleTranslator(
+                source=src,
+                target=GOOGLE_TARGET_CODES.get(self._target_lang, self._target_lang),
+            )
+            self._translator = _ThrottledTranslator(raw, delay=2.5, timeout=30.0)
+        return self._translator
+
+    def _translate_text(self, text):
+        if not text:
+            return ""
+        try:
+            result = self._get_translator().translate(text)
+            return (result or "").strip() or None
+        except Exception as e:
+            print(f"[TextEditDialog] translation failed: {e!r}")
+            return None
 
     def _build_ui(self):
         main = QHBoxLayout(self)
@@ -492,7 +538,7 @@ class TextEditDialog(QDialog):
         left.addWidget(hint)
 
         self._canvas = RegionCanvas()
-        self._canvas.set_image(self._original_img)
+        self._canvas.set_image(self._base_img)
         self._canvas.region_selected.connect(self._on_canvas_select)
         self._canvas.regions_changed.connect(self._on_regions_changed)
 
@@ -526,12 +572,15 @@ class TextEditDialog(QDialog):
         right.addWidget(self._table, stretch=1)
 
         btn_layout = QHBoxLayout()
-        btn_del = QPushButton("Delete Selected")
+        btn_del      = QPushButton("Delete Selected")
+        btn_merge    = QPushButton("Merge & Retranslate")
+        btn_separate = QPushButton("Separate & Retranslate")
         btn_del.clicked.connect(self._delete_selected)
-        btn_merge = QPushButton("Merge & Retranslate")   # changed label
         btn_merge.clicked.connect(self._merge_selected)
+        btn_separate.clicked.connect(self._separate_selected)
         btn_layout.addWidget(btn_del)
         btn_layout.addWidget(btn_merge)
+        btn_layout.addWidget(btn_separate)
         right.addLayout(btn_layout)
 
         grow = QHBoxLayout()
@@ -571,8 +620,11 @@ class TextEditDialog(QDialog):
         if row < 0:
             return
         menu = QMenu(self)
-        act_copy_orig = menu.addAction("Copy Original Text")
+        act_copy_orig  = menu.addAction("Copy Original Text")
         act_copy_trans = menu.addAction("Copy Translated Text")
+        menu.addSeparator()
+        act_separate   = menu.addAction("Separate & Retranslate")
+        act_merge      = menu.addAction("Merge & Retranslate")
         action = menu.exec(self._table.mapToGlobal(pos))
         if action == act_copy_orig:
             item = self._table.item(row, 1)
@@ -582,21 +634,11 @@ class TextEditDialog(QDialog):
             item = self._table.item(row, 2)
             if item:
                 QApplication.clipboard().setText(item.text())
+        elif action == act_separate:
+            self._separate_selected()
+        elif action == act_merge:
+            self._merge_selected()
 
-    # ---------- NEW helper: translate with Google (lightweight fallback) ----------
-    def _translate_with_google(self, text: str) -> str:
-        if not text:
-            return ""
-        try:
-            from deep_translator import GoogleTranslator
-            t = GoogleTranslator(source="auto", target=self._target_lang)
-            result = t.translate(text)
-            return result.strip() if result else ""
-        except Exception as e:
-            print(f"[TextEditDialog] Google translate failed: {e}")
-            return ""
-
-    # ---------- UPDATED merge: now merges original texts and retranslates ----------
     def _merge_selected(self):
         selected_rows = sorted(set(index.row() for index in self._table.selectedIndexes()))
         if len(selected_rows) < 2:
@@ -605,45 +647,150 @@ class TextEditDialog(QDialog):
 
         self._collect_from_table()
 
-        # Collect original texts and bbox of selected rows
-        merged_original = ' '.join(self._regions[i]['original_text'] for i in selected_rows)
-        merged_font_size = max(self._regions[i]['font_size'] for i in selected_rows)
+        merged_lines       = []
+        merged_line_bboxes = []
+        merged_line_quads  = []
+        all_x, all_y = [], []
+        merged_font_size = 12
 
-        all_x = []
-        all_y = []
         for i in selected_rows:
-            bbox = self._regions[i]['bbox']
+            r = self._regions[i]
+            lines  = r.get('lines') or [r.get('original_text', '')]
+            bboxes = r.get('line_bboxes') or []
+            quads  = r.get('line_quads') or []
+            merged_lines.extend(lines)
+            merged_line_bboxes.extend(bboxes)
+            merged_line_quads.extend(quads)
+
+            bbox = r['bbox']
             all_x.extend([p[0] for p in bbox])
             all_y.extend([p[1] for p in bbox])
+            merged_font_size = max(merged_font_size, r.get('font_size', 12))
 
         new_bbox = [
             [min(all_x), min(all_y)],
             [max(all_x), min(all_y)],
             [max(all_x), max(all_y)],
-            [min(all_x), max(all_y)]
+            [min(all_x), max(all_y)],
         ]
 
-        # Remove selected rows (reverse order)
         for i in sorted(selected_rows, reverse=True):
             del self._regions[i]
 
-        # Re-translate the merged original text (Google fallback)
-        translated_text = self._translate_with_google(merged_original)
-        if not translated_text:
-            translated_text = merged_original  # fallback to original if translate fails
+        source = self._get_pipeline()._join_lines(merged_lines)
+        translated_text = self._translate_text(source)
+        if translated_text is None:
+            QMessageBox.warning(
+                self, "Translation failed",
+                "Could not retranslate the merged text. Leaving the field "
+                "blank for manual editing.\n\nCheck the console for details."
+            )
+            translated_text = ""
 
-        # Add the new merged region
         self._regions.append({
-            'bbox': new_bbox,
-            'original_text': merged_original,
-            'text': translated_text,
-            'font_size': merged_font_size
+            'bbox':          new_bbox,
+            'original_text': source,
+            'source_text':   source,
+            'lines':         merged_lines,
+            'line_bboxes':   merged_line_bboxes,
+            'line_quads':    merged_line_quads,
+            'text':          translated_text,
+            'font_size':     merged_font_size,
         })
 
         self._refresh_table()
         self._update_preview()
 
-    # ---------- rest of the class unchanged ----------
+    def _separate_selected(self):
+        row = self._table.currentRow()
+        if row < 0 or row >= len(self._regions):
+            return
+
+        self._collect_from_table()
+        region = self._regions[row]
+
+        line_texts  = region.get('lines') or []
+        line_bboxes = region.get('line_bboxes') or []
+        line_quads  = region.get('line_quads') or []
+
+        if len(line_bboxes) < 2 or len(line_texts) < 2:
+            QMessageBox.information(
+                self, "Separate",
+                "This region has no recorded line geometry — "
+                "nothing to split. (Only regions produced by the pipeline "
+                "or by a previous Merge carry per-line data.)"
+            )
+            return
+
+        if len(line_quads) < len(line_texts):
+            line_quads = line_quads + [None] * (len(line_texts) - len(line_quads))
+
+        entries = list(zip(line_bboxes, line_texts, line_quads))
+
+        def ycenter(entry):
+            ys = [p[1] for p in entry[0]]
+            return (min(ys) + max(ys)) / 2
+
+        entries.sort(key=ycenter)
+
+        best_gap = -1.0
+        best_split = 0
+        for i in range(len(entries) - 1):
+            top_y2 = max(p[1] for p in entries[i][0])
+            bot_y1 = min(p[1] for p in entries[i + 1][0])
+            gap = bot_y1 - top_y2
+            if gap > best_gap:
+                best_gap = gap
+                best_split = i
+
+        top_group = entries[:best_split + 1]
+        bot_group = entries[best_split + 1:]
+
+        font_size = region.get('font_size', 12)
+        pipeline  = self._get_pipeline()
+        any_failed = [False]
+
+        def make_region(group):
+            bboxes = [e[0] for e in group]
+            texts  = [e[1] for e in group]
+            quads  = [e[2] for e in group if e[2] is not None]
+            all_x = [p[0] for b in bboxes for p in b]
+            all_y = [p[1] for b in bboxes for p in b]
+            bbox = [
+                [min(all_x), min(all_y)],
+                [max(all_x), min(all_y)],
+                [max(all_x), max(all_y)],
+                [min(all_x), max(all_y)],
+            ]
+            source = pipeline._join_lines(texts)
+            translated = self._translate_text(source)
+            if translated is None:
+                translated = ""
+                any_failed[0] = True
+            return {
+                'bbox':          bbox,
+                'original_text': source,
+                'source_text':   source,
+                'lines':         texts,
+                'line_bboxes':   bboxes,
+                'line_quads':    quads,
+                'text':          translated,
+                'font_size':     font_size,
+            }
+
+        new_regions = [make_region(top_group), make_region(bot_group)]
+        self._regions = self._regions[:row] + new_regions + self._regions[row + 1:]
+
+        if any_failed[0]:
+            QMessageBox.warning(
+                self, "Translation failed",
+                "Could not retranslate one or both halves. The translated "
+                "field is left blank for manual editing."
+            )
+
+        self._refresh_table()
+        self._update_preview()
+
     def _refresh_table(self):
         prev_sel = self._canvas.get_selected()
         self._table.blockSignals(True)
@@ -675,9 +822,9 @@ class TextEditDialog(QDialog):
 
     def _collect_from_table(self):
         for i in range(len(self._regions)):
-            item_orig = self._table.item(i, 1)
+            item_orig  = self._table.item(i, 1)
             item_trans = self._table.item(i, 2)
-            spin = self._table.cellWidget(i, 3)
+            spin       = self._table.cellWidget(i, 3)
             if item_orig is not None:
                 self._regions[i]['original_text'] = item_orig.text()
             if item_trans is not None:
@@ -730,7 +877,7 @@ class TextEditDialog(QDialog):
         self._update_preview()
 
     def _update_preview(self):
-        img = self._get_pipeline().render_from_regions(self._original_img, self._regions)
+        img = self._get_pipeline().render_from_regions(self._base_img, self._regions)
         self._canvas.set_image(img)
 
     def _save_and_close(self):
@@ -738,12 +885,13 @@ class TextEditDialog(QDialog):
         self._collect_from_table()
         try:
             self.result_image = self._get_pipeline().render_from_regions(
-                self._original_img, self._regions
+                self._base_img, self._regions
             )
         except Exception as e:
             print(f"[TextEditDialog] Render error: {e}")
             import traceback; traceback.print_exc()
         self.accept()
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -758,6 +906,9 @@ class MainWindow(QMainWindow):
         self.manual_zones   = {}
         self.worker         = None
         self._cfg           = _settings.load()
+
+        self._active_source_lang = "auto"
+        self._active_target_lang = "en"
 
         self._build_ui()
         self._apply_settings()
@@ -1111,8 +1262,17 @@ class MainWindow(QMainWindow):
             return
 
         ed = self.edit_data[path]
-        original_img = Image.open(path).convert("RGB")
-        dlg = TextEditDialog(self, path, original_img, ed['regions'], ed['target_lang'])
+        base_img = ed['base']
+
+        dlg = TextEditDialog(
+            self,
+            path,
+            base_img,
+            ed['regions'],
+            ed.get('source_lang', 'auto'),
+            ed.get('target_lang', 'en'),
+            ed.get('service', 'OPUS-MT (Offline)'),
+        )
         if dlg.exec() == QDialog.Accepted and dlg.result_image is not None:
             self.translated[path] = dlg.result_image
             self.edit_data[path]['regions'] = [dict(r) for r in dlg._regions]
@@ -1129,9 +1289,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No files", "Add at least one image file first.")
             return
 
+        self._active_source_lang = SOURCE_LANGUAGES[self.src_combo.currentText()]
+        self._active_target_lang = TARGET_LANGUAGES[self.tgt_combo.currentText()]
+
         settings = {
-            "source_lang":     SOURCE_LANGUAGES[self.src_combo.currentText()],
-            "target_lang":     TARGET_LANGUAGES[self.tgt_combo.currentText()],
+            "source_lang":     self._active_source_lang,
+            "target_lang":     self._active_target_lang,
             "service":         self.svc_combo.currentText(),
             "manual_zones":    self.manual_zones,
         }
@@ -1175,17 +1338,16 @@ class MainWindow(QMainWindow):
         self.edit_data[path]  = {
             'base':        payload['base'],
             'regions':     payload['regions'],
-            'target_lang': TARGET_LANGUAGES[self.tgt_combo.currentText()],
+            'source_lang': self._active_source_lang,
+            'target_lang': self._active_target_lang,
+            'service':     self.svc_combo.currentText(),
         }
 
         row = self.list_widget.currentRow()
         if 0 <= row < len(self.file_list) and self.file_list[row] == path:
             self.viewer_trans.set_pil_image(pil_image)
             self.tabs.setCurrentIndex(1)
-        self.btn_edit.setEnabled(
-            self.file_list[self.list_widget.currentRow()] == path
-            if 0 <= self.list_widget.currentRow() < len(self.file_list) else False
-        )
+            self.btn_edit.setEnabled(True)
 
     def _on_finished(self):
         self.btn_translate.setText("Translate All")
@@ -1222,7 +1384,7 @@ class MainWindow(QMainWindow):
                 dest_dir = p.parent.parent / f"{p.parent.name}_translated"
 
             dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / p.name
+            dest = dest_dir / f"{p.stem}_translated{p.suffix}"
             dest_dirs.add(str(dest_dir))
 
             save_kwargs = {"quality": 95} if p.suffix.lower() in (".jpg", ".jpeg") else {}

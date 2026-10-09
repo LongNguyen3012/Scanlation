@@ -3,82 +3,147 @@ import time
 import traceback
 from pathlib import Path
 
+import numpy as np
 import torch
 from PySide6.QtCore import QThread, Signal
 
 GOOGLE_TARGET_CODES = {
-    "en": "en",
-    "ja": "ja",
-    "ko": "ko",
-    "zh-CN": "zh-CN",
-    "zh-TW": "zh-TW",
-    "es": "es",
-    "fr": "fr",
-    "de": "de",
-    "pt": "pt",
-    "ru": "ru",
-    "it": "it",
-    "vi": "vi",
-    "th": "th",
+    "en": "en", "ja": "ja", "ko": "ko",
+    "zh-CN": "zh-CN", "zh-TW": "zh-TW",
+    "es": "es", "fr": "fr", "de": "de", "pt": "pt",
+    "ru": "ru", "it": "it", "vi": "vi", "th": "th",
 }
 
-EASYOCR_LANG_MAP = {
-    "ja": ["ja", "en"],
-    "ko": ["ko", "en"],
-    "ch_sim": ["ch_sim", "en"],
-    "ch_tra": ["ch_tra", "en"],
-    "en": ["en"],
-}
 
 class _ThrottledTranslator:
-    def __init__(self, translator, delay: float = 0.0, timeout: float = 20.0):
+    def __init__(self, translator, delay: float = 0.20, timeout: float = 30.0):
         self._t = translator
         self._delay = delay
         self._timeout = timeout
+        self._lock = threading.Lock()
 
     def translate(self, text: str) -> str:
         result = [None]
+        error = [None]
 
         def _call():
             try:
                 result[0] = self._t.translate(text)
-            except Exception:
-                pass
+            except Exception as e:
+                error[0] = e
 
-        t = threading.Thread(target=_call, daemon=True)
-        t.start()
-        t.join(timeout=self._timeout)
+        with self._lock:
+            t = threading.Thread(target=_call, daemon=True)
+            t.start()
+            t.join(timeout=self._timeout)
+            if t.is_alive():
+                raise TimeoutError(f"translate timed out after {self._timeout}s")
+            if self._delay:
+                time.sleep(self._delay)
 
-        if self._delay:
-            time.sleep(self._delay)
-
+        if error[0] is not None:
+            raise error[0]
         return result[0] or ""
 
-class RapidOCRWrapper:
-    def __init__(self):
-        from rapidocr_onnxruntime import RapidOCR
-        self._ocr = RapidOCR()
+
+class PaddleOCRWrapper:
+    def __init__(self, lang: str = "korean", use_gpu: bool = False):
+        from paddleocr import PaddleOCR
+
+        paddle_lang_map = {
+            "ko": "korean",
+            "ja": "japan",
+            "ch_sim": "ch",
+            "ch_tra": "chinese_cht",
+            "en": "en",
+        }
+        self._lang = paddle_lang_map.get(lang, "korean")
+
+        try:
+            self._ocr = PaddleOCR(
+                lang=self._lang,
+                enable_mkldnn=False,
+                use_textline_orientation=True,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+            )
+        except TypeError:
+            self._ocr = PaddleOCR(
+                use_angle_cls=True,
+                lang=self._lang,
+                use_gpu=use_gpu,
+                show_log=False,
+                enable_mkldnn=False,
+            )
+
+        print(f"[PaddleOCR] Initialised with lang='{self._lang}' (mkldnn disabled)")
 
     def readtext(self, img_np, **kwargs):
-        result, _ = self._ocr(img_np)
-        if result is None:
+        if img_np.ndim == 3 and img_np.shape[2] == 3:
+            img_bgr = np.ascontiguousarray(img_np[:, :, ::-1])
+        else:
+            img_bgr = img_np
+
+        try:
+            results = self._ocr.ocr(img_bgr)
+        except TypeError:
+            results = self._ocr.ocr(img_bgr, cls=True)
+
+        if not results:
+            return []
+        first = results[0]
+        if first is None:
             return []
         out = []
-        for item in result:
-            bbox = item[0]
-            text = item[1]
-            conf = float(item[2])
-            out.append((bbox, text, conf))
+
+        if isinstance(first, dict):
+            texts  = first.get("rec_texts")
+            scores = first.get("rec_scores")
+            boxes  = first.get("rec_boxes")
+            if boxes is None:
+                boxes = first.get("dt_polys")
+
+            texts_list  = list(texts) if texts is not None else []
+            scores_list = list(scores) if scores is not None else []
+            boxes_list  = list(boxes) if boxes is not None else []
+
+            for i, txt in enumerate(texts_list):
+                conf = float(scores_list[i]) if i < len(scores_list) else 0.0
+                if i >= len(boxes_list):
+                    continue
+                box = boxes_list[i]
+                if box is None:
+                    continue
+                try:
+                    arr = np.asarray(box).reshape(-1).astype(float)
+                    if arr.size == 4:
+                        x1, y1, x2, y2 = arr[0], arr[1], arr[2], arr[3]
+                    elif arr.size == 8:
+                        xs = arr[0::2]; ys = arr[1::2]
+                        x1, y1 = float(xs.min()), float(ys.min())
+                        x2, y2 = float(xs.max()), float(ys.max())
+                    else:
+                        continue
+                    quad = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                except Exception:
+                    continue
+                out.append((quad, str(txt), conf))
+            return out
+
+        for line in first:
+            bbox_points = line[0]
+            text_info = line[1]
+            out.append((bbox_points, text_info[0], float(text_info[1])))
         return out
+
 
 class MangaOCRWrapper:
     def __init__(self):
         import easyocr
         from manga_ocr import MangaOcr
         try:
-            import torch
             use_gpu = torch.cuda.is_available()
-        except ImportError:
+        except Exception:
             use_gpu = False
         self._detector = easyocr.Reader(["ja", "en"], gpu=use_gpu)
         self._recogniser = MangaOcr()
@@ -91,10 +156,8 @@ class MangaOCRWrapper:
         pil_img = Image.fromarray(img_np)
         out = []
         for bbox, _easyocr_text, conf in detections:
-            xs = [p[0] for p in bbox]
-            ys = [p[1] for p in bbox]
-            x1 = max(0, int(min(xs)))
-            y1 = max(0, int(min(ys)))
+            xs = [p[0] for p in bbox]; ys = [p[1] for p in bbox]
+            x1 = max(0, int(min(xs))); y1 = max(0, int(min(ys)))
             x2 = min(pil_img.width, int(max(xs)))
             y2 = min(pil_img.height, int(max(ys)))
             if x2 - x1 < 4 or y2 - y1 < 4:
@@ -107,52 +170,55 @@ class MangaOCRWrapper:
                 out.append((bbox, text, float(conf)))
         return out
 
+
 _OPUS_SRC_CODES = {
-    "ja": "ja",
-    "ja_manga": "ja",
-    "ko": "ko",
-    "ch_sim": "zh",
-    "ch_tra": "zh",
-    "en": "en",
+    "ja": "ja", "ja_manga": "ja", "ko": "ko",
+    "ch_sim": "zh", "ch_tra": "zh", "en": "en",
 }
 _OPUS_TGT_CODES = {
-    "en": "en",
-    "ja": "ja",
-    "ko": "ko",
-    "zh-CN": "zh",
-    "zh-TW": "zh",
-    "es": "es",
-    "fr": "fr",
-    "de": "de",
-    "pt": "pt",
-    "ru": "ru",
-    "it": "it",
-    "vi": "vi",
-    "th": "th",
+    "en": "en", "ja": "ja", "ko": "ko",
+    "zh-CN": "zh", "zh-TW": "zh",
+    "es": "es", "fr": "fr", "de": "de", "pt": "pt",
+    "ru": "ru", "it": "it", "vi": "vi", "th": "th",
 }
+
 
 class OpusMTTranslator:
     def __init__(self, from_ocr_code: str, to_code: str):
-        from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        try:
+            from transformers import MarianMTModel, MarianTokenizer
+        except ImportError as e:
+            raise RuntimeError(
+                "Marian classes not available. Install sentencepiece:\n"
+                "  pip install sentencepiece sacremoses"
+            ) from e
+
         self._torch = torch
         src = _OPUS_SRC_CODES.get(from_ocr_code, "en")
         tgt = _OPUS_TGT_CODES.get(to_code, "en")
 
-        for candidate in (
+        candidates = (
             f"Helsinki-NLP/opus-mt-{src}-{tgt}",
             f"Helsinki-NLP/opus-mt-tc-big-{src}-{tgt}",
-        ):
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(candidate)
-                self._model = AutoModelForSeq2SeqLM.from_pretrained(candidate)
-                self._model.eval()
-                return
-            except Exception:
-                pass
+        )
 
-        raise ValueError(
-            f"No OPUS-MT model found for {src}→{tgt}.  "
-            f"Switch to 'NLLB (Offline)' for this language pair."
+        errors = []
+        for candidate in candidates:
+            try:
+                print(f"[OpusMT] Loading {candidate}…")
+                self._tokenizer = MarianTokenizer.from_pretrained(candidate)
+                self._model = MarianMTModel.from_pretrained(candidate)
+                self._model.eval()
+                print(f"[OpusMT] Loaded {candidate}")
+                return
+            except Exception as e:
+                msg = f"{candidate}: {type(e).__name__}: {e}"
+                print(f"[OpusMT] Failed — {msg}")
+                errors.append(msg)
+
+        raise RuntimeError(
+            f"Could not load any OPUS-MT model for {src}→{tgt}:\n  "
+            + "\n  ".join(errors)
         )
 
     def translate(self, text: str) -> str:
@@ -164,8 +230,10 @@ class OpusMTTranslator:
             output = self._model.generate(**tokens, max_length=512)
         return self._tokenizer.decode(output[0], skip_special_tokens=True)
 
+
 class NLLBTranslator:
-    def __init__(self, from_ocr_code: str, to_code: str, model_name: str = "facebook/nllb-200-3.3B"):
+    def __init__(self, from_ocr_code: str, to_code: str,
+                 model_name: str = "facebook/nllb-200-3.3B"):
         from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
         self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -178,11 +246,12 @@ class NLLBTranslator:
 
     def _get_flores_code(self, code: str) -> str:
         mapping = {
-            "ja": "jpn_Jpan", "ko": "kor_Hang", "ch_sim": "zho_Hans",
-            "ch_tra": "zho_Hant", "en": "eng_Latn", "zh-CN": "zho_Hans",
-            "zh-TW": "zho_Hant", "es": "spa_Latn", "fr": "fra_Latn",
-            "de": "deu_Latn", "pt": "por_Latn", "ru": "rus_Cyrl",
-            "it": "ita_Latn", "vi": "vie_Latn", "th": "tha_Thai"
+            "ja": "jpn_Jpan", "ko": "kor_Hang",
+            "ch_sim": "zho_Hans", "ch_tra": "zho_Hant",
+            "en": "eng_Latn", "zh-CN": "zho_Hans", "zh-TW": "zho_Hant",
+            "es": "spa_Latn", "fr": "fra_Latn", "de": "deu_Latn",
+            "pt": "por_Latn", "ru": "rus_Cyrl", "it": "ita_Latn",
+            "vi": "vie_Latn", "th": "tha_Thai",
         }
         return mapping.get(code, "eng_Latn")
 
@@ -190,7 +259,8 @@ class NLLBTranslator:
         if hasattr(self.tokenizer, "src_lang"):
             self.tokenizer.src_lang = self.src_lang
 
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        inputs = self.tokenizer(text, return_tensors="pt",
+                                truncation=True, max_length=512)
         if torch.cuda.is_available():
             inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
@@ -203,9 +273,10 @@ class NLLBTranslator:
                 max_length=512,
                 num_beams=1,
                 do_sample=False,
-                early_stopping=True
+                early_stopping=True,
             )
         return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
 
 class TranslationWorker(QThread):
     progress = Signal(int, str)
@@ -234,41 +305,22 @@ class TranslationWorker(QThread):
             self.finished.emit()
 
     def _run_pipeline(self):
-        import easyocr
         from app.pipeline import ComicTranslationPipeline
 
         source_lang = self.settings["source_lang"]
         target_lang = self.settings["target_lang"]
         service = self.settings["service"]
 
-        if source_lang in {"ch_sim", "ch_tra"}:
-            self.progress.emit(0, "Loading RapidOCR Chinese model…")
-            reader = RapidOCRWrapper()
-        elif source_lang == "ja_manga":
-            self.progress.emit(
-                0,
-                "Loading Manga OCR — first run downloads ~450 MB to HuggingFace cache, please wait…"
-            )
+        if source_lang == "ja_manga":
+            self.progress.emit(0, "Loading Manga OCR — first run downloads ~450 MB…")
             reader = MangaOCRWrapper()
         else:
+            self.progress.emit(0, "Loading PaddleOCR — first run downloads ~200 MB…")
             try:
-                import torch
-                torch_available = True
-            except ImportError:
-                torch_available = False
-
-            if service == "NLLB (Offline)":
+                use_gpu = torch.cuda.is_available()
+            except Exception:
                 use_gpu = False
-            else:
-                use_gpu = torch.cuda.is_available() if torch_available else False
-
-            if source_lang == "auto":
-                self.progress.emit(0, "Loading multi-language OCR model — first run may download ~400 MB, please wait…")
-                ocr_langs = ["ja", "ch_sim", "ko", "en"]
-            else:
-                self.progress.emit(0, "Loading OCR model — first run may download ~200 MB, please wait…")
-                ocr_langs = EASYOCR_LANG_MAP.get(source_lang, ["en"])
-            reader = easyocr.Reader(ocr_langs, gpu=use_gpu)
+            reader = PaddleOCRWrapper(lang=source_lang, use_gpu=use_gpu)
 
         self.progress.emit(0, "Setting up translator…")
         try:
@@ -291,11 +343,9 @@ class TranslationWorker(QThread):
         for i, file_path in enumerate(self.files):
             if self._stopped:
                 break
-
             name = Path(file_path).name
             self.progress.emit(i, f"Page {i + 1} of {len(self.files)}  —  {name}")
             self.step.emit("")
-
             forced = manual_zones.get(file_path, [])
             print(f"[TranslationWorker] Processing {name}  forced_zones={len(forced)}")
             try:
@@ -324,19 +374,18 @@ class TranslationWorker(QThread):
               f"src={source_lang!r} tgt={target_lang!r}")
 
         if service == "Google Translate":
-            t = GoogleTranslator(
+            raw = GoogleTranslator(
                 source="auto",
                 target=GOOGLE_TARGET_CODES.get(target_lang, target_lang),
             )
-            print("[TranslationWorker] Google Translate ready")
-            return t
+            print("[TranslationWorker] Google Translate ready (throttled)")
+            return _ThrottledTranslator(raw, delay=2.5, timeout=30.0)
 
         elif service == "OPUS-MT (Offline)":
-            opus_src = "ja" if source_lang == "auto" else source_lang
+            opus_src = source_lang
             self.progress.emit(
                 0,
-                f"Loading OPUS-MT {opus_src}→{target_lang} model "
-                f"— first run downloads ~350 MB to HuggingFace cache, please wait…"
+                f"Loading OPUS-MT {opus_src}→{target_lang} — first run downloads ~350 MB…"
             )
             print(f"[TranslationWorker] Loading OPUS-MT {opus_src}→{target_lang}")
             t = OpusMTTranslator(opus_src, target_lang)
@@ -346,7 +395,7 @@ class TranslationWorker(QThread):
         elif service == "NLLB (Offline)":
             self.progress.emit(
                 0,
-                "Loading NLLB-200 3.3B model — first run downloads ~6.5 GB to HuggingFace cache, please wait…"
+                "Loading NLLB-200 3.3B — first run downloads ~6.5 GB…"
             )
             print("[TranslationWorker] Loading NLLB-200 3.3B")
             t = NLLBTranslator(source_lang, target_lang)
